@@ -1,0 +1,32 @@
+# ElioP2P build
+build/
+.worktrees/
+
+# Design documents
+docs/
+
+# CMake build artifacts
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+Makefile
+Testing/
+_deps/
+bin/
+cmake_install.cmake
+compile_commands.json
+lib/
+src/CMakeFiles/
+src/CTestTestfile.cmake
+src/Makefile
+src/cmake_install.cmake
+test/CMakeFiles/
+test/CTestTestfile.cmake
+test/Makefile
+test/cmake_install.cmake
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
