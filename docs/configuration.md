@@ -162,14 +162,20 @@ Examples:
 
 ## Storage Configuration
 
+The storage client does NOT require access key/secret key by default. It forwards the authentication from the client's request:
+
+- **Presigned URL**: Forward as-is or re-sign if credentials provided
+- **Header Signature**: Forward as-is or re-sign if credentials provided
+- **Public Bucket**: No authentication needed
+
 ### S3
 
 ```ini
 [storage]
 endpoint = http://s3.amazonaws.com
 region = us-east-1
-access_key = your_access_key
-secret_key = your_secret_key
+# access_key = your_access_key   # Optional: only if you need to re-sign requests
+# secret_key = your_secret_key   # Optional
 ```
 
 ### OSS
@@ -178,10 +184,24 @@ secret_key = your_secret_key
 [storage]
 endpoint = http://oss-cn-shanghai.aliyuncs.com
 region = cn-shanghai
-access_key = your_access_key
-secret_key = your_secret_key
-bucket = your_bucket
+# access_key = your_access_key   # Optional
+# secret_key = your_secret_key   # Optional
+# bucket = your_bucket           # Optional: default bucket
 ```
+
+### Authentication Flow
+
+1. Client sends request to ElioP2P proxy with authentication
+2. Proxy checks local cache
+3. If cache miss, proxy forwards the authentication to storage:
+   - Presigned URL query string → forwarded as-is
+   - Authorization header → forwarded as-is
+   - No authentication → access public bucket directly
+
+This design ensures:
+- No credential leakage risk
+- Works with STS temporary tokens
+- Users don't need to configure credentials
 
 ## Kubernetes Deployment
 
