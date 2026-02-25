@@ -13,12 +13,11 @@ namespace {
 
 // Log level parsing - used when setting log level from config
 static LogLevel parse_log_level(const std::string& level) {
-    if (level == "debug") return LogLevel::DEBUG;
-    if (level == "info") return LogLevel::INFO;
-    if (level == "warning") return LogLevel::WARNING;
-    if (level == "error") return LogLevel::ERROR;
-    if (level == "fatal") return LogLevel::FATAL;
-    return LogLevel::INFO;
+    if (level == "debug") return elio::log::level::debug;
+    if (level == "info") return elio::log::level::info;
+    if (level == "warning") return elio::log::level::warning;
+    if (level == "error") return elio::log::level::error;
+    return elio::log::level::info;
 }
 
 std::string trim(const std::string& str) {

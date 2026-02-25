@@ -1,72 +1,35 @@
 #include "eliop2p/base/logger.h"
-#include <iostream>
-#include <chrono>
-#include <iomanip>
-#include <algorithm>
+#include <fmt/core.h>
 
 namespace eliop2p {
-
-namespace {
-
-const char* level_to_string(LogLevel level) {
-    switch (level) {
-        case LogLevel::DEBUG: return "DEBUG";
-        case LogLevel::INFO: return "INFO";
-        case LogLevel::WARNING: return "WARN";
-        case LogLevel::ERROR: return "ERROR";
-        case LogLevel::FATAL: return "FATAL";
-        default: return "UNKNOWN";
-    }
-}
-
-std::string get_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()) % 1000;
-
-    std::ostringstream oss;
-    oss << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S");
-    oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-    return oss.str();
-}
-
-} // anonymous namespace
 
 Logger::~Logger() {
     close_file_output();
 }
 
 Logger& Logger::instance() {
-    static Logger instance;
-    return instance;
+    static Logger inst;
+    return inst;
 }
 
 void Logger::set_level(LogLevel level) {
-    std::lock_guard<std::mutex> lock(mutex_);
     level_ = level;
+    logger_.set_level(level);
 }
 
-LogLevel Logger::get_level() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return level_;
+elio::log::level Logger::get_level() const {
+    return logger_.get_level();
 }
 
 void Logger::set_output(LogOutput output) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    output_ = output;
+    // Note: Elio logger outputs to stderr by default
+    // File output is handled separately if needed
+    (void)output;
 }
 
 void Logger::set_file_output(const std::string& path) {
-    std::lock_guard<std::mutex> lock(mutex_);
     close_file_output();
     file_stream_ = std::make_unique<std::ofstream>(path, std::ios::app);
-    if (!file_stream_->is_open()) {
-        std::cerr << "Failed to open log file: " << path << std::endl;
-        file_stream_.reset();
-    } else {
-        output_ = LogOutput::File;
-    }
 }
 
 void Logger::close_file_output() {
@@ -77,51 +40,27 @@ void Logger::close_file_output() {
 }
 
 void Logger::log(LogLevel level, const std::string& message) {
-    if (level < level_) return;
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    write_log(level, message);
-}
-
-void Logger::write_log(LogLevel level, const std::string& message) {
-    std::ostringstream oss;
-    oss << "[" << get_timestamp() << "] [" << level_to_string(level) << "] " << message;
-    std::string formatted = oss.str();
-
-    switch (output_) {
-        case LogOutput::Stdout:
-            std::cout << formatted << std::endl;
-            break;
-        case LogOutput::Stderr:
-            std::cerr << formatted << std::endl;
-            break;
-        case LogOutput::File:
-            if (file_stream_ && file_stream_->is_open()) {
-                *file_stream_ << formatted << std::endl;
-                file_stream_->flush();
-            }
-            break;
-    }
+    logger_.log(level, "", 0, "{}", message);
 }
 
 void Logger::debug(const std::string& message) {
-    log(LogLevel::DEBUG, message);
+    logger_.log(elio::log::level::debug, "", 0, "{}", message);
 }
 
 void Logger::info(const std::string& message) {
-    log(LogLevel::INFO, message);
+    logger_.log(elio::log::level::info, "", 0, "{}", message);
 }
 
 void Logger::warning(const std::string& message) {
-    log(LogLevel::WARNING, message);
+    logger_.log(elio::log::level::warning, "", 0, "{}", message);
 }
 
 void Logger::error(const std::string& message) {
-    log(LogLevel::ERROR, message);
+    logger_.log(elio::log::level::error, "", 0, "{}", message);
 }
 
 void Logger::fatal(const std::string& message) {
-    log(LogLevel::FATAL, message);
+    logger_.log(elio::log::level::error, "", 0, "FATAL: {}", message);
 }
 
 } // namespace eliop2p
