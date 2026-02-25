@@ -2,9 +2,6 @@
 build/
 .worktrees/
 
-# Design documents
-docs/
-
 # CMake build artifacts
 CMakeCache.txt
 CMakeFiles/
