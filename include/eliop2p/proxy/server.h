@@ -58,6 +58,10 @@ public:
     // Enable/disable P2P fallback
     void set_p2p_fallback_enabled(bool enabled);
 
+    // Get stop event file descriptor for external signaling
+    // Returns -1 if server is not running
+    int get_stop_event_fd() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
