@@ -9,6 +9,7 @@ target_include_directories(base_obj PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${ELIO_INCLUDE_DIR}
     ${FMT_INCLUDE_DIR}
+    ${CLI11_INCLUDE_DIR}
 )
 if(TARGET Elio::Elio)
     target_link_libraries(base_obj PUBLIC Elio::Elio)
@@ -44,10 +45,11 @@ if(TARGET Elio::Elio)
     target_link_libraries(p2p_obj PUBLIC Elio::Elio)
 endif()
 
-# Control plane client
+# Control plane client and server
 add_library(control_obj OBJECT)
 target_sources(control_obj PRIVATE
     control/client.cpp
+    control/server.cpp
     control/metadata.cpp
 )
 

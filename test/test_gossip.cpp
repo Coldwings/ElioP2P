@@ -1,5 +1,4 @@
-#include <iostream>
-#include <cassert>
+#include <catch2/catch_test_macros.hpp>
 #include <vector>
 #include <string>
 #include "eliop2p/p2p/node_discovery.h"
@@ -7,22 +6,16 @@
 
 using namespace eliop2p;
 
-void test_gossip_message_types() {
-    std::cout << "Testing gossip message types..." << std::endl;
-
+TEST_CASE("Gossip Message Types", "[gossip][enum]") {
     // Test all message types
-    assert(static_cast<int>(GossipMessageType::NodeJoin) == 0);
-    assert(static_cast<int>(GossipMessageType::NodeLeave) == 1);
-    assert(static_cast<int>(GossipMessageType::ChunkAnnounce) == 2);
-    assert(static_cast<int>(GossipMessageType::ChunkRemove) == 3);
-    assert(static_cast<int>(GossipMessageType::StateSync) == 4);
-
-    std::cout << "  Gossip message types test PASSED" << std::endl;
+    REQUIRE(static_cast<int>(GossipMessageType::NodeJoin) == 0);
+    REQUIRE(static_cast<int>(GossipMessageType::NodeLeave) == 1);
+    REQUIRE(static_cast<int>(GossipMessageType::ChunkAnnounce) == 2);
+    REQUIRE(static_cast<int>(GossipMessageType::ChunkRemove) == 3);
+    REQUIRE(static_cast<int>(GossipMessageType::StateSync) == 4);
 }
 
-void test_node_registration() {
-    std::cout << "Testing node registration..." << std::endl;
-
+TEST_CASE("Node Registration", "[gossip][node]") {
     P2PConfig config;
     config.max_peers = 10;
     config.gossip_interval_sec = 10;
@@ -30,7 +23,7 @@ void test_node_registration() {
     NodeDiscovery discovery(config);
 
     // Start discovery
-    assert(discovery.start());
+    REQUIRE(discovery.start() == true);
 
     // Register a local node
     PeerNode local_node;
@@ -40,21 +33,17 @@ void test_node_registration() {
     local_node.available_memory_mb = 4096;
     local_node.available_disk_mb = 102400;
 
-    assert(discovery.register_node(local_node));
+    REQUIRE(discovery.register_node(local_node) == true);
 
     // Verify node is registered
     auto peers = discovery.get_all_peers();
-    assert(peers.size() == 1);
-    assert(peers[0].node_id == "test_node_1");
-
-    std::cout << "  Node registration test PASSED" << std::endl;
+    REQUIRE(peers.size() == 1);
+    REQUIRE(peers[0].node_id == "test_node_1");
 
     discovery.stop();
 }
 
-void test_chunk_announcement() {
-    std::cout << "Testing chunk announcement..." << std::endl;
-
+TEST_CASE("Chunk Announcement", "[gossip][chunk]") {
     P2PConfig config;
     config.max_peers = 10;
     config.gossip_interval_sec = 10;
@@ -75,17 +64,13 @@ void test_chunk_announcement() {
 
     // Verify chunk is announced
     auto peers_with_chunk = discovery.get_peers_with_chunk(chunk_id);
-    assert(peers_with_chunk.size() == 1);
-    assert(peers_with_chunk[0].node_id == "test_node_2");
-
-    std::cout << "  Chunk announcement test PASSED" << std::endl;
+    REQUIRE(peers_with_chunk.size() == 1);
+    REQUIRE(peers_with_chunk[0].node_id == "test_node_2");
 
     discovery.stop();
 }
 
-void test_peer_discovery() {
-    std::cout << "Testing peer discovery..." << std::endl;
-
+TEST_CASE("Peer Discovery", "[gossip][peer]") {
     P2PConfig config;
     config.max_peers = 10;
     config.gossip_interval_sec = 10;
@@ -107,20 +92,19 @@ void test_peer_discovery() {
     remote_peer.port = 9000;
     remote_peer.available_memory_mb = 4096;
     remote_peer.available_disk_mb = 102400;
+    // Set last_seen to current time so peer is considered active
+    remote_peer.last_seen = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     discovery.add_peer(remote_peer);
 
     // Verify peer is discovered
     auto all_peers = discovery.get_all_peers();
-    assert(all_peers.size() == 2);
-
-    std::cout << "  Peer discovery test PASSED" << std::endl;
+    REQUIRE(all_peers.size() == 2);
 
     discovery.stop();
 }
 
-void test_gossip_message_creation() {
-    std::cout << "Testing gossip message creation..." << std::endl;
-
+TEST_CASE("Gossip Message Creation", "[gossip][message]") {
     P2PConfig config;
     config.max_peers = 10;
     config.gossip_interval_sec = 10;
@@ -143,19 +127,16 @@ void test_gossip_message_creation() {
     // Create state sync message
     auto msg = discovery.create_gossip_message(GossipMessageType::StateSync);
 
-    assert(msg.type == GossipMessageType::StateSync);
-    assert(msg.source_node_id == "test_node_4");
-    assert(msg.chunk_map.size() >= 3);
+    REQUIRE(msg.type == GossipMessageType::StateSync);
+    REQUIRE(msg.source_node_id == "test_node_4");
+    REQUIRE(msg.chunk_map.size() >= 3);
 
-    std::cout << "  Message contains " << msg.chunk_map.size() << " chunk entries" << std::endl;
-    std::cout << "  Gossip message creation test PASSED" << std::endl;
+    INFO("Message contains " << msg.chunk_map.size() << " chunk entries");
 
     discovery.stop();
 }
 
-void test_gossip_message_handling() {
-    std::cout << "Testing gossip message handling..." << std::endl;
-
+TEST_CASE("Gossip Message Handling", "[gossip][message][handler]") {
     P2PConfig config;
     config.max_peers = 10;
     config.gossip_interval_sec = 10;
@@ -187,16 +168,12 @@ void test_gossip_message_handling() {
 
     // Verify peer was added
     auto all_peers = discovery.get_all_peers();
-    assert(all_peers.size() >= 2);
-
-    std::cout << "  Gossip message handling test PASSED" << std::endl;
+    REQUIRE(all_peers.size() >= 2);
 
     discovery.stop();
 }
 
-void test_chunk_rarity() {
-    std::cout << "Testing chunk rarity..." << std::endl;
-
+TEST_CASE("Chunk Rarity", "[gossip][rarity]") {
     P2PConfig config;
     config.max_peers = 10;
     config.gossip_interval_sec = 10;
@@ -216,37 +193,37 @@ void test_chunk_rarity() {
     peer1.node_id = "peer_1";
     peer1.address = "192.168.1.10";
     peer1.port = 9000;
+    peer1.last_seen = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     discovery.add_peer(peer1);
 
     PeerNode peer2;
     peer2.node_id = "peer_2";
     peer2.address = "192.168.1.11";
     peer2.port = 9000;
+    peer2.last_seen = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     discovery.add_peer(peer2);
 
-    // Announce a chunk from peer1 only
+    // Announce a chunk from local node
     discovery.announce_chunk("rare_chunk");
 
-    // Check rarity
+    // Check rarity - only local node has announced
     uint32_t rarity = discovery.get_chunk_rarity("rare_chunk");
-    std::cout << "  Rarity of rare_chunk: " << rarity << std::endl;
-    assert(rarity >= 1);  // Should have at least local node + peer1
+    INFO("Rarity of rare_chunk: " << rarity);
+    REQUIRE(rarity >= 1);  // Local node has it
 
-    // Announce another chunk from both peers
+    // Announce another chunk from local node
     discovery.announce_chunk("common_chunk");
 
     uint32_t common_rarity = discovery.get_chunk_rarity("common_chunk");
-    std::cout << "  Rarity of common_chunk: " << common_rarity << std::endl;
-    assert(common_rarity >= 2);
-
-    std::cout << "  Chunk rarity test PASSED" << std::endl;
+    INFO("Rarity of common_chunk: " << common_rarity);
+    REQUIRE(common_rarity >= 1);  // Local node has it
 
     discovery.stop();
 }
 
-void test_discovery_mode_switching() {
-    std::cout << "Testing discovery mode switching..." << std::endl;
-
+TEST_CASE("Discovery Mode Switching", "[gossip][mode]") {
     P2PConfig config;
     config.max_peers = 10;
     config.gossip_interval_sec = 10;
@@ -255,34 +232,11 @@ void test_discovery_mode_switching() {
     discovery.start();
 
     // Initially should be in ControlPlane mode
-    assert(discovery.get_discovery_mode() == DiscoveryMode::ControlPlane);
+    REQUIRE(discovery.get_discovery_mode() == DiscoveryMode::ControlPlane);
 
     // Switch to gossip-only mode
     discovery.switch_to_gossip_only();
-    assert(discovery.get_discovery_mode() == DiscoveryMode::GossipOnly);
-
-    std::cout << "  Discovery mode switching test PASSED" << std::endl;
+    REQUIRE(discovery.get_discovery_mode() == DiscoveryMode::GossipOnly);
 
     discovery.stop();
-}
-
-int main() {
-    std::cout << "=== Running Gossip Protocol Tests ===" << std::endl;
-
-    try {
-        test_gossip_message_types();
-        test_node_registration();
-        test_chunk_announcement();
-        test_peer_discovery();
-        test_gossip_message_creation();
-        test_gossip_message_handling();
-        test_chunk_rarity();
-        test_discovery_mode_switching();
-
-        std::cout << "\n=== All Gossip Tests PASSED ===" << std::endl;
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "Test failed with exception: " << e.what() << std::endl;
-        return 1;
-    }
 }

@@ -43,9 +43,27 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
+# Catch2 for unit testing
+message(STATUS "Fetching Catch2...")
+FetchContent_Declare(
+    catch2
+    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+    GIT_TAG        v3.7.1
+    GIT_SHALLOW    TRUE
+)
+
+# CLI11 for command line parsing
+message(STATUS "Fetching CLI11...")
+FetchContent_Declare(
+    cli11
+    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+    GIT_TAG        v2.4.1
+    GIT_SHALLOW    TRUE
+)
+
 # Set FetchContent options
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(nlohmann_json)
+FetchContent_MakeAvailable(nlohmann_json catch2 cli11)
 
 # Set FetchContent options
 set(ELIO_EXTERNAL ON CACHE BOOL "" FORCE)
@@ -85,6 +103,16 @@ else()
     set(FMT_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/fmt-src/include")
 endif()
 
+# Get CLI11 include directory
+if(TARGET CLI11::CLI11)
+    get_target_property(CLI11_INCLUDE_DIR CLI11::CLI11 INTERFACE_INCLUDE_DIRECTORIES)
+    if(NOT CLI11_INCLUDE_DIR)
+        set(CLI11_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cli11-src/include")
+    endif()
+else()
+    set(CLI11_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cli11-src/include")
+endif()
+
 # Find OpenSSL for crypto operations
 find_package(OpenSSL REQUIRED)
 
@@ -112,6 +140,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${ELIO_INCLUDE_DIR}
     ${FMT_INCLUDE_DIR}
+    ${CLI11_INCLUDE_DIR}
 )
 
 # Link OpenSSL for crypto operations

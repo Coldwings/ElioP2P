@@ -110,7 +110,6 @@ S3Client::S3Client(const StorageConfig& config)
         impl_->secret_key = *config.secret_key;
         access_key_ = *config.access_key;
         secret_key_ = *config.secret_key;
-        auth_type_ = AuthType::HeaderSigned;
     }
     Logger::instance().info("S3Client initialized with endpoint: " + config.endpoint);
 }

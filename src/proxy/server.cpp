@@ -4,7 +4,6 @@
 #include <elio/elio.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/http/http.hpp>
-#include <elio/signal/signalfd.hpp>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -13,7 +12,6 @@
 #include <functional>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <signal.h>
 
 namespace eliop2p {
 
@@ -28,16 +26,12 @@ struct ProxyServer::Impl {
     std::shared_ptr<ChunkManager> cache_manager;
     std::shared_ptr<StorageClient> storage_client;
     std::shared_ptr<RequestHandler> request_handler;
-    std::shared_ptr<elio::runtime::scheduler> scheduler;
     std::thread server_thread;
     std::shared_ptr<TransferManager> transfer_manager;
     bool enable_p2p_fallback = true;
 
     // Server instance for elio::serve
     std::unique_ptr<elio::http::server> http_server;
-
-    // HTTP server scheduler (separate from main scheduler)
-    std::shared_ptr<elio::runtime::scheduler> http_scheduler;
 
     // Pipe for stop notification
     int stop_pipe[2] = {-1, -1};
@@ -55,16 +49,6 @@ ProxyServer::ProxyServer(const ProxyConfig& config,
     // Create pipe for stop notification
     if (pipe(impl_->stop_pipe) == -1) {
         Logger::instance().error("Failed to create stop pipe");
-    }
-
-    // Create scheduler for HTTP server and storage client
-    impl_->scheduler = std::make_shared<elio::runtime::scheduler>(4);
-    impl_->scheduler->start();
-
-    // Set scheduler on storage client if it's an S3 client
-    if (storage_client) {
-        // The storage client can use the scheduler for async HTTP operations
-        // This is handled internally by the S3 client when making requests
     }
 }
 
@@ -188,40 +172,22 @@ bool ProxyServer::start() {
     impl_->server_thread = std::thread([this, bind_addr, opts]() {
         Logger::instance().info("Proxy HTTP server thread started");
 
-        // Use elio::run with empty signals to avoid signal handling conflicts
-        auto main_task = [this]() -> elio::coro::task<void> {
-            // Periodically check running flag
+        elio::run([this, bind_addr, opts]() -> elio::coro::task<void> {
+            auto listen_task = impl_->http_server->listen(bind_addr, opts);
+            auto listen_handle = std::move(listen_task).spawn();
+
+            // Wait for running flag to become false
             while (impl_->running) {
                 co_await elio::time::sleep_for(std::chrono::milliseconds(100));
             }
 
-            // Running flag is false, initiate shutdown
-            Logger::instance().info("Server shutdown requested");
-            co_return;
-        };
-
-        // HTTP server task using elio::serve
-        auto http_task = [this, bind_addr, opts]() -> elio::coro::task<void> {
-            co_await elio::serve(*impl_->http_server,
-                                 impl_->http_server->listen(bind_addr, opts),
-                                 {});  // Empty signals to disable signal handling
-        };
-
-        // Run both tasks concurrently
-        elio::run([&]() -> elio::coro::task<void> {
-            auto ctrl = main_task();
-            auto ctrl_handle = ctrl.spawn();
-
-            auto http = http_task();
-            auto http_handle = http.spawn();
-
-            // Wait for either to complete
-            co_await ctrl_handle;
-
-            // Stop HTTP server and wait for it to finish
+            // Stop the HTTP server
+            Logger::instance().info("Stopping HTTP server");
             impl_->http_server->stop();
-            co_await http_handle;
+            // Wait for listen task to complete
+            co_await listen_handle;
 
+            Logger::instance().info("HTTP server stopped");
             co_return;
         }());
 
@@ -237,26 +203,18 @@ bool ProxyServer::start() {
 
 void ProxyServer::stop() {
     if (impl_->running) {
-        Logger::instance().info("Stopping proxy server");
+        Logger::instance().info("Stopping proxy server - setting running to false");
         impl_->running = false;
 
-        // Stop the HTTP server - this sets internal running_ = false
-        if (impl_->http_server) {
-            impl_->http_server->stop();
-        }
-
-        // Wait for server thread to finish with a timeout
+        // Wait for server thread to finish briefly
         if (impl_->server_thread.joinable()) {
-            // Use timed join to avoid hanging forever
-            // elio::serve may block on accept() even after server.stop() is called
-            constexpr auto timeout = std::chrono::seconds(3);
+            constexpr auto timeout = std::chrono::seconds(1);
             auto start = std::chrono::steady_clock::now();
 
-            // Simple polling join with timeout
             while (impl_->server_thread.joinable()) {
                 auto elapsed = std::chrono::steady_clock::now() - start;
                 if (elapsed >= timeout) {
-                    Logger::instance().warning("Server thread join timeout (3s), forcing exit");
+                    Logger::instance().warning("Server thread join timeout, detaching");
                     impl_->server_thread.detach();
                     break;
                 }
@@ -264,20 +222,7 @@ void ProxyServer::stop() {
             }
         }
 
-        // Shutdown scheduler
-        if (impl_->scheduler) {
-            impl_->scheduler->shutdown();
-        }
-
-        // Close pipe
-        if (impl_->stop_pipe[0] != -1) {
-            close(impl_->stop_pipe[0]);
-            impl_->stop_pipe[0] = -1;
-        }
-        if (impl_->stop_pipe[1] != -1) {
-            close(impl_->stop_pipe[1]);
-            impl_->stop_pipe[1] = -1;
-        }
+        Logger::instance().info("Proxy server stopped");
     }
 }
 

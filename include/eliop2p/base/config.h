@@ -68,6 +68,18 @@ struct ControlPlaneConfig {
     bool enable = true;
 };
 
+// Control plane server configuration (when running as server)
+struct ControlPlaneServerConfig {
+    std::string bind_address = "0.0.0.0";
+    uint16_t listen_port = 8082;
+    uint32_t heartbeat_timeout_sec = 90;
+    uint32_t cleanup_interval_sec = 30;
+    uint32_t max_nodes = 1000;
+    bool enable_replica_adjustment = true;
+    uint32_t min_replicas = 2;
+    uint32_t max_replicas = 5;
+};
+
 // Storage configuration
 struct StorageConfig {
     std::string type = "s3";  // s3, oss
@@ -97,6 +109,7 @@ struct GlobalConfig {
     CacheConfig cache;
     P2PConfig p2p;
     ControlPlaneConfig control_plane;
+    ControlPlaneServerConfig control_plane_server;
     StorageConfig storage;
     ProxyConfig proxy;
 };

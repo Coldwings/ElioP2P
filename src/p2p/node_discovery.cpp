@@ -1073,10 +1073,15 @@ void NodeDiscovery::handle_node_join(const GossipMessage& msg) {
     for (const auto& [peer_id, peer] : msg.peer_updates) {
         if (peer_id != impl_->local_node_id) {
             bool is_new = impl_->peers.find(peer_id) == impl_->peers.end();
-            impl_->peers[peer_id] = peer;
+
+            // Update last_seen timestamp so peer is considered active
+            PeerNode peer_to_add = peer;
+            peer_to_add.last_seen = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            impl_->peers[peer_id] = peer_to_add;
 
             if (is_new && impl_->on_node_discovered) {
-                impl_->on_node_discovered(peer);
+                impl_->on_node_discovered(peer_to_add);
                 Logger::instance().info("New peer discovered via gossip: " + peer_id);
             }
         }

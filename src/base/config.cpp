@@ -1,5 +1,6 @@
 #include "eliop2p/base/config.h"
 #include "eliop2p/base/logger.h"
+#include "CLI/CLI.hpp"
 #include <fstream>
 #include <cstdlib>
 #include <filesystem>
@@ -220,68 +221,108 @@ void Config::override_from_env() {
 }
 
 bool Config::parse_command_line(int argc, char* argv[]) {
-    override_from_cmdline(argc, argv);
+    // Create CLI11 app with description
+    CLI::App app{"ElioP2P - Distributed P2P Cache Acceleration System"};
+
+    // Config file option
+    std::string config_file;
+    app.add_option("-c,--config", config_file, "Path to configuration file");
+
+    // Node options
+    app.add_option("--node-id", config_.node.node_id, "Node identifier");
+    app.add_option("--bind-address", config_.node.bind_address, "Bind address");
+    app.add_option("--http-port", config_.node.http_port, "HTTP listen port");
+
+    // Log options
+    app.add_option("--log-level", config_.log.level, "Log level (debug, info, warning, error)");
+    app.add_option("--log-output", config_.log.output, "Log output (stdout, stderr, file)");
+    app.add_option("--log-file", config_.log.file_path, "Log file path");
+
+    // Cache options
+    app.add_option("--cache-memory-size", config_.cache.memory_cache_size_mb, "Memory cache size (MB)");
+    app.add_option("--cache-disk-size", config_.cache.disk_cache_size_mb, "Disk cache size (MB)");
+    app.add_option("--cache-chunk-size", config_.cache.chunk_size_mb, "Chunk size (MB)");
+    app.add_option("--cache-disk-path", config_.cache.disk_cache_path, "Disk cache path");
+    app.add_option("--cache-eviction-threshold", config_.cache.eviction_threshold, "Eviction threshold (0.0-1.0)");
+    app.add_option("--cache-eviction-target", config_.cache.eviction_target, "Eviction target (0.0-1.0)");
+
+    // P2P options
+    app.add_option("--p2p-port", config_.p2p.listen_port, "P2P listen port");
+    app.add_option("--p2p-max-connections", config_.p2p.max_connections, "Maximum P2P connections");
+    app.add_option("--p2p-max-peers", config_.p2p.max_peers, "Maximum number of peers");
+    app.add_option("--p2p-max-upload-speed", config_.p2p.max_upload_speed_mbps, "Maximum upload speed (Mbps, 0=unlimited)");
+    app.add_option("--p2p-max-download-speed", config_.p2p.max_download_speed_mbps, "Maximum download speed (Mbps, 0=unlimited)");
+    app.add_option("--p2p-selection-k", config_.p2p.selection_k, "Number of peers to select for transfer");
+    app.add_option("--p2p-gossip-interval", config_.p2p.gossip_interval_sec, "Gossip interval (seconds)");
+    app.add_option("--p2p-heartbeat-timeout", config_.p2p.heartbeat_timeout_sec, "Heartbeat timeout (seconds)");
+    app.add_option("--p2p-transport", config_.p2p.transport, "Transport type (tcp, rdma)");
+
+    // Control plane options
+    app.add_option("--control-plane-endpoint", config_.control_plane.endpoint, "Control plane endpoint");
+    app.add_option("--control-plane-port", config_.control_plane.port, "Control plane port");
+    app.add_option("--control-plane-heartbeat", config_.control_plane.heartbeat_interval_sec, "Control plane heartbeat interval (seconds)");
+    app.add_option("--control-plane-reconnect", config_.control_plane.reconnect_interval_sec, "Control plane reconnect interval (seconds)");
+    app.add_flag("--control-plane-enable", config_.control_plane.enable, "Enable control plane");
+
+    // Control plane server options
+    app.add_option("--control-server-port", config_.control_plane_server.listen_port, "Control plane server listen port");
+    app.add_option("--control-server-bind", config_.control_plane_server.bind_address, "Control plane server bind address");
+    app.add_option("--control-server-timeout", config_.control_plane_server.heartbeat_timeout_sec, "Control plane server heartbeat timeout (seconds)");
+    app.add_option("--control-server-max-nodes", config_.control_plane_server.max_nodes, "Control plane server max nodes");
+    app.add_option("--control-server-min-replicas", config_.control_plane_server.min_replicas, "Control plane server min replicas per chunk");
+    app.add_option("--control-server-max-replicas", config_.control_plane_server.max_replicas, "Control plane server max replicas per chunk");
+
+    // Storage options
+    app.add_option("--storage-type", config_.storage.type, "Storage type (s3, oss)");
+    app.add_option("--storage-endpoint", config_.storage.endpoint, "Object storage endpoint URL");
+    app.add_option("--storage-region", config_.storage.region, "Object storage region");
+    app.add_option("--storage-bucket", config_.storage.bucket, "Object storage bucket");
+    app.add_option("--storage-access-key", config_.storage.access_key, "Object storage access key");
+    app.add_option("--storage-secret-key", config_.storage.secret_key, "Object storage secret key");
+    app.add_flag("--storage-https", config_.storage.use_https, "Use HTTPS for storage");
+    app.add_option("--storage-connection-timeout", config_.storage.connection_timeout_sec, "Storage connection timeout (seconds)");
+    app.add_option("--storage-read-timeout", config_.storage.read_timeout_sec, "Storage read timeout (seconds)");
+
+    // Proxy options
+    app.add_option("--proxy-port", config_.proxy.listen_port, "HTTP proxy listen port");
+    app.add_option("--proxy-bind-address", config_.proxy.bind_address, "HTTP proxy bind address");
+    app.add_option("--proxy-max-connections", config_.proxy.max_connections, "Maximum proxy connections");
+    app.add_option("--proxy-auth-type", config_.proxy.auth_type, "Proxy authentication type (none, basic, token)");
+    app.add_option("--proxy-auth-token", config_.proxy.auth_token, "Proxy authentication token");
+
+    // Add version option
+    app.set_version_flag("-v,--version", "0.1.0");
+
+    try {
+        // Parse arguments - this will handle --help automatically
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& e) {
+        // For help/version, we don't want to exit, just return false
+        if (e.get_exit_code() == 0) {
+            // This was a help or version request - the app already printed it
+            return false;
+        }
+        // For other parse errors, exit immediately with the error code
+        std::cerr << "Command line parse error: " << e.what() << std::endl;
+        return false;
+    }
+
+    // Load config file if specified
+    if (!config_file.empty()) {
+        load_from_file(config_file);
+    }
+
+    // Apply log level from config
+    if (!config_.log.level.empty()) {
+        Logger::instance().set_level(parse_log_level(config_.log.level));
+    }
+
     return true;
 }
 
-void Config::override_from_cmdline(int argc, char* argv[]) {
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-
-        // Parse --config=path or -c path
-        if (arg == "--config" || arg == "-c") {
-            if (i + 1 < argc) {
-                load_from_file(argv[++i]);
-            }
-            continue;
-        }
-        if (arg.rfind("--config=", 0) == 0) {
-            load_from_file(arg.substr(9));
-            continue;
-        }
-
-        // Parse --node-id=value
-        if (arg.rfind("--node-id=", 0) == 0) {
-            config_.node.node_id = arg.substr(11);
-            continue;
-        }
-
-        // Parse --log-level=value
-        if (arg.rfind("--log-level=", 0) == 0) {
-            config_.log.level = arg.substr(12);
-            continue;
-        }
-
-        // Parse --p2p-port=value
-        if (arg.rfind("--p2p-port=", 0) == 0) {
-            config_.p2p.listen_port = std::stoi(arg.substr(11));
-            continue;
-        }
-
-        // Parse --proxy-port=value
-        if (arg.rfind("--proxy-port=", 0) == 0) {
-            config_.proxy.listen_port = std::stoi(arg.substr(12));
-            continue;
-        }
-
-        // Parse --control-plane=value
-        if (arg.rfind("--control-plane=", 0) == 0) {
-            config_.control_plane.endpoint = arg.substr(16);
-            continue;
-        }
-
-        // Parse --storage-endpoint=value
-        if (arg.rfind("--storage-endpoint=", 0) == 0) {
-            config_.storage.endpoint = arg.substr(19);
-            continue;
-        }
-
-        // Parse --cache-size=value (MB)
-        if (arg.rfind("--cache-size=", 0) == 0) {
-            config_.cache.memory_cache_size_mb = std::stoull(arg.substr(12));
-            continue;
-        }
-    }
+void Config::override_from_cmdline(int /*argc*/, char* /*argv*/[]) {
+    // This function is kept for backward compatibility but is no longer used
+    // The CLI11 parsing is done in parse_command_line() directly
 }
 
 bool Config::validate() const {

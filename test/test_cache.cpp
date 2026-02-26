@@ -1,5 +1,4 @@
-#include <iostream>
-#include <cassert>
+#include <catch2/catch_test_macros.hpp>
 #include <vector>
 #include <string>
 #include "eliop2p/cache/lru_cache.h"
@@ -8,45 +7,39 @@
 
 using namespace eliop2p;
 
-void test_lru_cache_basic() {
-    std::cout << "Testing basic LRU cache operations..." << std::endl;
-
+TEST_CASE("LRU Cache Basic Operations", "[cache][lru]") {
     // Create a cache with 1KB capacity
     LRUCache cache(1024);
 
     // Test put and get
     std::vector<uint8_t> data1 = {1, 2, 3, 4, 5};
-    assert(cache.put("key1", data1));
-    assert(cache.exists("key1"));
+    REQUIRE(cache.put("key1", data1) == true);
+    REQUIRE(cache.exists("key1") == true);
 
     auto result = cache.get("key1");
-    assert(result.has_value());
-    assert(result->data() == data1);
+    REQUIRE(result.has_value() == true);
+    REQUIRE(result->data() == data1);
 
     // Test eviction
     std::vector<uint8_t> large_data(512, 0xFF);
     cache.put("key2", large_data);
 
     // After putting large data, key1 should still exist (2*5 + 512 = 522 < 1024)
-    assert(cache.exists("key1"));
+    REQUIRE(cache.exists("key1") == true);
 
     // Put more data to trigger eviction
     std::vector<uint8_t> more_data(512, 0xAA);
     cache.put("key3", more_data);
 
     // At this point, some eviction may have occurred
-    std::cout << "  Cache usage: " << (cache.usage() * 100) << "%" << std::endl;
+    INFO("Cache usage: " << (cache.usage() * 100) << "%");
 
     auto stats = cache.stats();
-    std::cout << "  Hits: " << stats.hits << ", Misses: " << stats.misses << std::endl;
-    std::cout << "  Evictions: " << stats.evictions << std::endl;
-
-    std::cout << "  Basic LRU cache test PASSED" << std::endl;
+    INFO("Hits: " << stats.hits << ", Misses: " << stats.misses);
+    INFO("Evictions: " << stats.evictions);
 }
 
-void test_lru_cache_eviction() {
-    std::cout << "Testing LRU cache eviction..." << std::endl;
-
+TEST_CASE("LRU Cache Eviction", "[cache][lru][eviction]") {
     // Create a cache with limited capacity
     LRUCache cache(100);
 
@@ -57,17 +50,14 @@ void test_lru_cache_eviction() {
     }
 
     auto stats = cache.stats();
-    std::cout << "  After 20 inserts: items=" << stats.total_items
-              << ", evictions=" << stats.evictions << std::endl;
+    INFO("After 20 inserts: items=" << stats.total_items
+              << ", evictions=" << stats.evictions);
 
     // Verify eviction occurred
-    assert(stats.evictions > 0);
-    std::cout << "  Eviction test PASSED" << std::endl;
+    REQUIRE(stats.evictions > 0);
 }
 
-void test_chunk_manager() {
-    std::cout << "Testing ChunkManager..." << std::endl;
-
+TEST_CASE("ChunkManager Basic Operations", "[cache][chunk]") {
     CacheConfig config;
     config.memory_cache_size_mb = 64;  // 64MB
     config.disk_cache_size_mb = 128;   // 128MB
@@ -87,29 +77,25 @@ void test_chunk_manager() {
     std::vector<uint8_t> chunk_data(1024, 0x42);
     std::string chunk_id = "test_object_0";
 
-    assert(manager.store_chunk(chunk_id, chunk_data));
+    REQUIRE(manager.store_chunk(chunk_id, chunk_data) == true);
 
     // Test chunk retrieval
     auto retrieved = manager.get_chunk(chunk_id);
-    assert(retrieved.has_value());
-    assert(retrieved->data() == chunk_data);
+    REQUIRE(retrieved.has_value() == true);
+    REQUIRE(retrieved->data() == chunk_data);
 
     // Test chunk existence
-    assert(manager.has_chunk(chunk_id));
+    REQUIRE(manager.has_chunk(chunk_id) == true);
 
     // Test SHA256 verification
-    assert(manager.verify_chunk(chunk_id, chunk_data));
+    REQUIRE(manager.verify_chunk(chunk_id, chunk_data) == true);
 
     // Test chunk removal
-    assert(manager.remove_chunk(chunk_id));
-    assert(!manager.has_chunk(chunk_id));
-
-    std::cout << "  ChunkManager test PASSED" << std::endl;
+    REQUIRE(manager.remove_chunk(chunk_id) == true);
+    REQUIRE(manager.has_chunk(chunk_id) == false);
 }
 
-void test_multi_factor_eviction() {
-    std::cout << "Testing multi-factor weighted eviction..." << std::endl;
-
+TEST_CASE("Multi-Factor Weighted Eviction", "[cache][eviction][multi-factor]") {
     // Create cache with custom eviction weights
     LRUCache cache(100, 1.0f, 0.5f, 0.3f);
 
@@ -125,16 +111,12 @@ void test_multi_factor_eviction() {
     }
 
     auto stats = cache.stats();
-    std::cout << "  Hot items: " << stats.hot_items
-              << ", Warm items: " << stats.warm_items
-              << ", Cold items: " << stats.cold_items << std::endl;
-
-    std::cout << "  Multi-factor eviction test PASSED" << std::endl;
+    INFO("Hot items: " << stats.hot_items);
+    INFO("Warm items: " << stats.warm_items);
+    INFO("Cold items: " << stats.cold_items);
 }
 
-void test_cache_stats() {
-    std::cout << "Testing cache statistics..." << std::endl;
-
+TEST_CASE("Cache Statistics", "[cache][stats]") {
     CacheConfig config;
     config.memory_cache_size_mb = 64;
     config.hot_threshold = 100;
@@ -156,27 +138,7 @@ void test_cache_stats() {
     }
 
     auto mem_stats = manager.get_memory_cache_stats();
-    std::cout << "  Memory cache items: " << mem_stats.total_items << std::endl;
-    std::cout << "  Memory cache bytes: " << mem_stats.total_bytes << std::endl;
-    std::cout << "  Hit rate: " << (mem_stats.hit_rate() * 100) << "%" << std::endl;
-
-    std::cout << "  Cache statistics test PASSED" << std::endl;
-}
-
-int main() {
-    std::cout << "=== Running Cache Module Tests ===" << std::endl;
-
-    try {
-        test_lru_cache_basic();
-        test_lru_cache_eviction();
-        test_chunk_manager();
-        test_multi_factor_eviction();
-        test_cache_stats();
-
-        std::cout << "\n=== All Tests PASSED ===" << std::endl;
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "Test failed with exception: " << e.what() << std::endl;
-        return 1;
-    }
+    INFO("Memory cache items: " << mem_stats.total_items);
+    INFO("Memory cache bytes: " << mem_stats.total_bytes);
+    INFO("Hit rate: " << (mem_stats.hit_rate() * 100) << "%");
 }
