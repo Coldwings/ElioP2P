@@ -29,5 +29,20 @@ if(ENABLE_TESTING)
     target_link_libraries(test_storage PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto Catch2::Catch2WithMain)
     catch_discover_tests(test_storage)
 
+    # Add integration test executable
+    add_executable(test_integration test_integration.cpp)
+    target_link_libraries(test_integration PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto Catch2::Catch2WithMain)
+    catch_discover_tests(test_integration)
+
+    # Add functional test executable
+    add_executable(test_functional test_functional.cpp)
+    target_link_libraries(test_functional PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto Catch2::Catch2WithMain)
+    catch_discover_tests(test_functional)
+
+    # Add E2E test executable
+    add_executable(test_e2e test_e2e.cpp)
+    target_link_libraries(test_e2e PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto Catch2::Catch2WithMain)
+    catch_discover_tests(test_e2e)
+
     message(STATUS "Testing enabled with Catch2")
 endif()
