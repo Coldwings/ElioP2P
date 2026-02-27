@@ -27,3 +27,4 @@ test/cmake_install.cmake
 .idea/
 *.swp
 *.swo
+.claude/
