@@ -11,8 +11,8 @@
 #include <cstdint>
 #include <unordered_map>
 #include <chrono>
-#include <mutex>
 #include <elio/elio.hpp>
+#include <elio/sync/primitives.hpp>
 
 namespace eliop2p {
 
@@ -110,7 +110,8 @@ private:
     uint64_t max_bytes_per_sec_;
     uint64_t available_;
     std::chrono::steady_clock::time_point last_reset_;
-    mutable std::mutex mutex_;
+    mutable elio::sync::spinlock mutex_;
+    uint64_t wait_time_ms_ = 0;  // Pre-calculated wait time for co_await
 };
 
 // Connection state for P2P transfer

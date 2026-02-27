@@ -2,6 +2,8 @@
 #include "eliop2p/base/logger.h"
 #include "eliop2p/base/config.h"
 #include <elio/net/tcp.hpp>
+#include <elio/sync/primitives.hpp>
+#include <elio/time/timer.hpp>
 #include <chrono>
 #include <fstream>
 #include <algorithm>
@@ -10,7 +12,6 @@
 #include <functional>
 #include <cstring>
 #include <arpa/inet.h>
-#include <thread>
 
 namespace eliop2p {
 
@@ -21,36 +22,41 @@ BandwidthLimiter::BandwidthLimiter(uint64_t max_mbps)
       last_reset_(std::chrono::steady_clock::now()) {}
 
 elio::coro::task<void> BandwidthLimiter::acquire(uint64_t bytes) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Use spinlock for short critical sections
+    // Note: Must release lock before co_await to avoid blocking other coroutines
+    {
+        elio::sync::spinlock_guard lock(mutex_);
 
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_reset_).count();
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_reset_).count();
 
-    if (elapsed >= 1) {
-        available_ = max_bytes_per_sec_;
-        last_reset_ = now;
-    }
+        if (elapsed >= 1) {
+            available_ = max_bytes_per_sec_;
+            last_reset_ = now;
+        }
 
-    if (available_ >= bytes) {
-        available_ -= bytes;
-        co_return;
-    }
+        if (available_ >= bytes) {
+            available_ -= bytes;
+            co_return;
+        }
 
-    // Wait for bandwidth to become available
-    uint64_t wait_ms = ((bytes - available_) * 1000) / std::max<uint64_t>(max_bytes_per_sec_ / 1024, 1);
-    co_await elio::time::sleep_for(std::chrono::milliseconds(wait_ms));
+        // Calculate wait time while holding lock, then release
+        wait_time_ms_ = ((bytes - available_) * 1000) / std::max<uint64_t>(max_bytes_per_sec_ / 1024, 1);
+        available_ = 0;
+    } // Lock released here
 
-    available_ = 0;
+    // Wait outside the lock to not block other coroutines
+    co_await elio::time::sleep_for(std::chrono::milliseconds(wait_time_ms_));
 }
 
 void BandwidthLimiter::set_limit(uint64_t mbps) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    elio::sync::spinlock_guard lock(mutex_);
     max_bytes_per_sec_ = mbps * 1024 * 1024 / 8;
     available_ = max_bytes_per_sec_;
 }
 
 uint64_t BandwidthLimiter::available_bytes() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    elio::sync::spinlock_guard lock(mutex_);
     return available_;
 }
 
