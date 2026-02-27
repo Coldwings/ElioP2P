@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <shared_mutex>
 
 // Include Elio hash for SHA256
 #include <elio/hash/sha256.hpp>
@@ -22,6 +23,9 @@ struct ChunkManager::Impl {
     std::unordered_map<std::string, ChunkMetadata> metadata;
     std::string disk_cache_path;
     bool initialized = false;
+
+    // Thread safety: shared_mutex for concurrent read access
+    mutable std::shared_mutex cache_mutex_;
 
     Impl(const CacheConfig& cfg)
         : config(cfg),
@@ -176,6 +180,9 @@ ChunkManager::ChunkManager(const CacheConfig& config)
 ChunkManager::~ChunkManager() = default;
 
 std::optional<Chunk> ChunkManager::get_chunk(const std::string& chunk_id) {
+    // Use shared lock for reading - allows concurrent readers
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+
     // Try memory cache first
     auto chunk = impl_->memory_cache->get(chunk_id);
     if (chunk) {
@@ -216,6 +223,9 @@ bool ChunkManager::store_chunk(const std::string& chunk_id, const std::vector<ui
 }
 
 bool ChunkManager::store_chunk(const ChunkMetadata& metadata, const std::vector<uint8_t>& data) {
+    // Use exclusive lock for writing
+    std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+
     // Verify data size matches expected
     if (metadata.size > 0 && data.size() != metadata.size) {
         Logger::instance().error("Chunk size mismatch for: " + metadata.chunk_id);
@@ -239,6 +249,9 @@ bool ChunkManager::store_chunk(const ChunkMetadata& metadata, const std::vector<
 }
 
 bool ChunkManager::remove_chunk(const std::string& chunk_id) {
+    // Use exclusive lock for writing
+    std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+
     bool from_memory = impl_->memory_cache->remove(chunk_id);
     bool from_disk = impl_->disk_cache->remove(chunk_id);
 
@@ -250,11 +263,14 @@ bool ChunkManager::remove_chunk(const std::string& chunk_id) {
 }
 
 bool ChunkManager::has_chunk(const std::string& chunk_id) const {
+    // Use shared lock for reading
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     return impl_->memory_cache->exists(chunk_id) ||
            impl_->disk_cache->exists(chunk_id);
 }
 
 std::optional<ChunkMetadata> ChunkManager::get_metadata(const std::string& chunk_id) const {
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     auto it = impl_->metadata.find(chunk_id);
     if (it != impl_->metadata.end()) {
         return it->second;

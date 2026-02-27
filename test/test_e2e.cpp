@@ -183,22 +183,16 @@ TEST_CASE("E2E_HighLoadScenario - Concurrent request handling", "[e2e][load][con
         cache->store_chunk("load_test_" + std::to_string(i), data);
     }
 
-    // Simulate concurrent access with thread-local cache copies
-    // Note: ChunkManager is not thread-safe, so we use separate instances per thread
+    // Simulate concurrent access - ChunkManager is now thread-safe with shared_mutex
     const int NUM_THREADS = 4;
     std::vector<std::thread> workers;
     std::atomic<int> success_count{0};
     std::atomic<int> fail_count{0};
-    std::atomic<int> total_access{0};
 
     for (int t = 0; t < NUM_THREADS; t++) {
-        workers.emplace_back([&cache, &success_count, &fail_count, &total_access, t]() {
-            // Create thread-local copy of cache config for reading
-            // In production, ChunkManager would need proper synchronization
+        workers.emplace_back([&cache, &success_count, &fail_count, t]() {
             for (int i = 0; i < 20; i++) {
                 std::string key = "load_test_" + std::to_string((t * 20 + i) % 50);
-                total_access++;
-                // Use a simple read pattern that's safer for concurrent access
                 if (cache->has_chunk(key)) {
                     auto data = cache->get_chunk(key);
                     if (data.has_value()) {
@@ -209,8 +203,6 @@ TEST_CASE("E2E_HighLoadScenario - Concurrent request handling", "[e2e][load][con
                 } else {
                     fail_count++;
                 }
-                // Small delay to reduce contention
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
         });
     }
@@ -222,7 +214,6 @@ TEST_CASE("E2E_HighLoadScenario - Concurrent request handling", "[e2e][load][con
 
     INFO("Successful requests: " << success_count.load());
     INFO("Failed requests: " << fail_count.load());
-    INFO("Total access attempts: " << total_access.load());
 
     REQUIRE(success_count.load() > 0);
     REQUIRE(fail_count.load() == 0);
