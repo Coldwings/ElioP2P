@@ -55,6 +55,9 @@ jobs:
           name: build-artifacts
           path: build/
 
+      - name: Set executable permissions
+        run: chmod +x ./build/bin/test_*
+
       - name: Run unit tests (cache)
         run: |
           ./build/bin/test_cache
@@ -84,6 +87,9 @@ jobs:
           name: build-artifacts
           path: build/
 
+      - name: Set executable permissions
+        run: chmod +x ./build/bin/test_*
+
       - name: Run integration tests
         run: |
           ./build/bin/test_integration
@@ -101,6 +107,9 @@ jobs:
           name: build-artifacts
           path: build/
 
+      - name: Set executable permissions
+        run: chmod +x ./build/bin/test_*
+
       - name: Run functional tests
         run: |
           ./build/bin/test_functional
@@ -117,6 +126,9 @@ jobs:
         with:
           name: build-artifacts
           path: build/
+
+      - name: Set executable permissions
+        run: chmod +x ./build/bin/test_*
 
       - name: Run E2E tests
         run: |
