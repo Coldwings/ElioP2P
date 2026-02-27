@@ -57,6 +57,7 @@ struct P2PConfig {
     uint32_t gossip_interval_sec = 10;
     uint32_t heartbeat_timeout_sec = 60;
     std::string transport = "tcp";  // tcp, rdma
+    size_t worker_threads = 0;  // 0 = auto-detect (hardware_concurrency)
 };
 
 // Control plane configuration

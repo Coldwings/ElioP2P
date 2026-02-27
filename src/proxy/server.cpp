@@ -28,6 +28,7 @@ struct ProxyServer::Impl {
     std::shared_ptr<RequestHandler> request_handler;
     std::thread server_thread;
     std::shared_ptr<TransferManager> transfer_manager;
+    std::shared_ptr<elio::runtime::scheduler> scheduler;  // External scheduler for coroutines
     bool enable_p2p_fallback = true;
 
     // Server instance for elio::serve
@@ -249,6 +250,10 @@ void ProxyServer::set_transfer_manager(std::unique_ptr<TransferManager> transfer
         impl_->request_handler->set_transfer_manager(impl_->transfer_manager);
     }
     Logger::instance().info("Transfer manager connected to proxy server");
+}
+
+void ProxyServer::set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) {
+    impl_->scheduler = scheduler;
 }
 
 void ProxyServer::set_p2p_fallback_enabled(bool enabled) {

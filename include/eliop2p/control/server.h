@@ -62,6 +62,9 @@ public:
     std::optional<std::vector<ChunkLocation>> query_chunk_locations(
         const std::vector<std::string>& chunk_ids) const;
 
+    // Set scheduler for coroutines (for global scheduler integration)
+    void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

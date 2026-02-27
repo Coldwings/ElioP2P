@@ -103,6 +103,9 @@ public:
 
     // Get backend type
     virtual StorageBackend get_backend_type() const = 0;
+
+    // Set scheduler for async HTTP operations (virtual for interface)
+    virtual void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) = 0;
 };
 
 // Forward declaration

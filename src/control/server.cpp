@@ -52,6 +52,9 @@ struct ControlPlaneServer::Impl {
     // HTTP server instance
     std::unique_ptr<elio::http::server> http_server;
 
+    // Scheduler for coroutines
+    std::shared_ptr<elio::runtime::scheduler> scheduler;
+
     // Pipe for stop notification
     int stop_pipe[2] = {-1, -1};
 
@@ -677,6 +680,10 @@ std::optional<std::vector<ChunkLocation>> ControlPlaneServer::query_chunk_locati
     }
 
     return locations;
+}
+
+void ControlPlaneServer::set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) {
+    impl_->scheduler = scheduler;
 }
 
 } // namespace eliop2p

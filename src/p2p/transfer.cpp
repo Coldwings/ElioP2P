@@ -82,6 +82,7 @@ struct TransferManager::Impl {
 
     // TCP server for serving chunks to other peers
     std::shared_ptr<elio::runtime::scheduler> scheduler;
+    bool scheduler_owned = false;  // true if we created the scheduler, false if provided externally
     std::atomic<bool> tcp_server_running{false};
     std::thread tcp_server_thread;
     std::optional<elio::net::tcp_listener> tcp_listener;
@@ -287,6 +288,7 @@ elio::coro::task<void> TransferManager::start_tcp_server() {
     if (!impl_->scheduler) {
         // Create default scheduler if not set
         impl_->scheduler = std::make_shared<elio::runtime::scheduler>(2);
+        impl_->scheduler_owned = true;
     }
 
     // Create and bind TCP listener
@@ -338,6 +340,7 @@ void TransferManager::stop_tcp_server() {
 
 void TransferManager::set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) {
     impl_->scheduler = std::move(scheduler);
+    impl_->scheduler_owned = false;  // Scheduler is now externally owned
 }
 
 void TransferManager::set_chunk_data_provider(ChunkDataProvider provider) {

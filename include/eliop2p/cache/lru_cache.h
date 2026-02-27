@@ -7,6 +7,7 @@
 #include <optional>
 #include <memory>
 #include <functional>
+#include <mutex>
 
 namespace eliop2p {
 

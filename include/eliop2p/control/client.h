@@ -114,6 +114,9 @@ public:
     // Get pending replication commands
     elio::coro::task<std::optional<std::vector<ReplicationCommand>>> fetch_replication_commands();
 
+    // Set scheduler for coroutines (for global scheduler integration)
+    void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -145,6 +145,9 @@ public:
     // Get scheduler for spawning coroutines
     std::shared_ptr<elio::runtime::scheduler> get_scheduler() const;
 
+    // Set scheduler (for global scheduler integration)
+    void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

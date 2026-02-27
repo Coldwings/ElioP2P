@@ -52,6 +52,7 @@ struct NodeDiscovery::Impl {
 
     // TCP server state
     std::shared_ptr<elio::runtime::scheduler> scheduler;
+    bool scheduler_owned = false;  // true if we created the scheduler, false if provided externally
     std::atomic<bool> tcp_server_running{false};
     std::thread tcp_server_thread;
     std::optional<elio::net::tcp_listener> tcp_listener;
@@ -174,12 +175,19 @@ struct NodeDiscovery::Impl {
         tcp_server_running = true;
         server_stopped = false;
 
-        tcp_server_thread = std::thread([this, port]() {
+        // Check if we should use an existing scheduler or create a new one
+        bool use_existing_scheduler = (scheduler != nullptr);
+        scheduler_owned = !use_existing_scheduler;
+
+        tcp_server_thread = std::thread([this, port, use_existing_scheduler]() {
             Logger::instance().info("Starting TCP gossip server on port " + std::to_string(port));
 
-            // Create scheduler for TCP server
-            scheduler = std::make_shared<elio::runtime::scheduler>(2);
-            scheduler->start();
+            // Use existing scheduler if provided, otherwise create a new one
+            if (!use_existing_scheduler) {
+                scheduler = std::make_shared<elio::runtime::scheduler>(2);
+                scheduler->start();
+                scheduler_owned = true;
+            }
 
             // Bind TCP listener
             elio::net::tcp_options opts;
@@ -194,7 +202,9 @@ struct NodeDiscovery::Impl {
                 Logger::instance().error("Failed to bind TCP listener: " + std::string(strerror(errno)));
                 tcp_server_running = false;
                 server_stopped = true;
-                scheduler->shutdown();
+                if (scheduler_owned) {
+                    scheduler->shutdown();
+                }
                 return;
             }
 
@@ -647,10 +657,11 @@ struct NodeDiscovery::Impl {
             tcp_server_thread.join();
         }
 
-        // Shutdown scheduler
-        if (scheduler) {
+        // Shutdown scheduler only if we created it locally
+        if (scheduler && scheduler_owned) {
             scheduler->shutdown();
             scheduler.reset();
+            scheduler_owned = false;
         }
 
         Logger::instance().info("TCP gossip server stopped");
@@ -1282,6 +1293,11 @@ void NodeDiscovery::stop_tcp_server() {
 
 std::shared_ptr<elio::runtime::scheduler> NodeDiscovery::get_scheduler() const {
     return impl_->scheduler;
+}
+
+void NodeDiscovery::set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) {
+    impl_->scheduler = scheduler;
+    impl_->scheduler_owned = false;  // Scheduler is now externally owned
 }
 
 // Private methods for TCP communication

@@ -59,6 +59,10 @@ struct LRUCache::Impl {
     uint64_t current_size_ = 0;
     CacheStats stats_;
 
+    // Thread safety: recursive_mutex to allow nested locking
+    // (e.g., get() calling touch() while holding the lock)
+    mutable std::recursive_mutex mutex_;
+
     // Eviction weights for multi-factor LRU
     float eviction_weight_time_ = 1.0f;
     float eviction_weight_replica_ = 0.5f;
@@ -199,6 +203,8 @@ LRUCache::LRUCache(LRUCache&& other) noexcept = default;
 LRUCache& LRUCache::operator=(LRUCache&& other) noexcept = default;
 
 std::optional<Chunk> LRUCache::get(const std::string& key) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+
     auto it = impl_->cache_.find(key);
     if (it == impl_->cache_.end()) {
         impl_->stats_.misses++;
@@ -220,6 +226,8 @@ std::optional<Chunk> LRUCache::get(const std::string& key) {
 }
 
 bool LRUCache::put(const std::string& key, const std::vector<uint8_t>& data) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+
     // Check if key already exists
     auto it = impl_->cache_.find(key);
     if (it != impl_->cache_.end()) {
@@ -256,6 +264,8 @@ bool LRUCache::put(const std::string& key, const std::vector<uint8_t>& data) {
 }
 
 bool LRUCache::remove(const std::string& key) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+
     auto it = impl_->cache_.find(key);
     if (it == impl_->cache_.end()) {
         return false;
@@ -276,10 +286,12 @@ bool LRUCache::remove(const std::string& key) {
 }
 
 bool LRUCache::exists(const std::string& key) const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     return impl_->cache_.find(key) != impl_->cache_.end();
 }
 
 void LRUCache::clear() {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     impl_->cache_.clear();
     impl_->lru_list_.clear();
     impl_->lru_map_.clear();
@@ -288,15 +300,18 @@ void LRUCache::clear() {
 }
 
 void LRUCache::set_eviction_callback(EvictionCallback callback) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     impl_->eviction_callback = std::move(callback);
 }
 
 CacheStats LRUCache::stats() const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     impl_->update_heat_counts();
     return impl_->stats_;
 }
 
 void LRUCache::maybe_evict() {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     float usage = static_cast<float>(impl_->current_size_) / impl_->max_capacity_;
     if (usage > 0.8f) {
         // Evict until usage is below 60%
@@ -308,6 +323,7 @@ void LRUCache::maybe_evict() {
 }
 
 void LRUCache::evict_to_target() {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     float usage = static_cast<float>(impl_->current_size_) / impl_->max_capacity_;
     while (usage > 0.6f && !impl_->lru_list_.empty()) {
         impl_->evict_one();
@@ -316,20 +332,24 @@ void LRUCache::evict_to_target() {
 }
 
 float LRUCache::usage() const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     return static_cast<float>(impl_->current_size_) / impl_->max_capacity_;
 }
 
 uint64_t LRUCache::current_size() const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     return impl_->current_size_;
 }
 
 uint64_t LRUCache::max_capacity() const {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     return impl_->max_capacity_;
 }
 
 void LRUCache::update_chunk_metadata(const std::string& key,
                                       uint32_t replica_count,
                                       HeatLevel heat_level) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     auto it = impl_->cache_.find(key);
     if (it != impl_->cache_.end()) {
         it->second.set_replica_count(replica_count);
@@ -338,6 +358,7 @@ void LRUCache::update_chunk_metadata(const std::string& key,
 }
 
 void LRUCache::set_heat_thresholds(uint32_t hot_threshold, uint32_t warm_threshold) {
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     impl_->hot_threshold_ = hot_threshold;
     impl_->warm_threshold_ = warm_threshold;
 }

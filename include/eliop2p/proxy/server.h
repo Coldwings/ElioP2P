@@ -55,6 +55,9 @@ public:
     // Set transfer manager from unique_ptr
     void set_transfer_manager(std::unique_ptr<TransferManager> transfer_manager);
 
+    // Set scheduler for coroutines (for global scheduler integration)
+    void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler);
+
     // Enable/disable P2P fallback
     void set_p2p_fallback_enabled(bool enabled);
 

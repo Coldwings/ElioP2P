@@ -169,7 +169,8 @@ TEST_CASE("E2E_SystemLifecycle - Complete startup and shutdown", "[e2e][lifecycl
 
 // ============================================================================
 // E2E Test 4: High Load Scenario
-// Tests system under concurrent requests
+// Tests system under concurrent requests with true multi-threading
+// LRUCache now uses recursive_mutex for thread safety
 // ============================================================================
 TEST_CASE("E2E_HighLoadScenario - Concurrent request handling", "[e2e][load][concurrent]") {
     CacheConfig cache_config;
@@ -183,7 +184,7 @@ TEST_CASE("E2E_HighLoadScenario - Concurrent request handling", "[e2e][load][con
         cache->store_chunk("load_test_" + std::to_string(i), data);
     }
 
-    // Simulate concurrent access - ChunkManager is now thread-safe with shared_mutex
+    // Simulate concurrent access - LRUCache is now thread-safe with recursive_mutex
     const int NUM_THREADS = 4;
     std::vector<std::thread> workers;
     std::atomic<int> success_count{0};

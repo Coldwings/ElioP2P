@@ -17,6 +17,7 @@
 #include "eliop2p/control/client.h"
 #include "eliop2p/control/server.h"
 #include "eliop2p/storage/s3_client.h"
+#include <elio/elio.hpp>
 
 using namespace eliop2p;
 
@@ -46,6 +47,10 @@ public:
         if (control_plane_server_) {
             control_plane_server_->stop();
         }
+        // Shutdown global scheduler
+        if (global_scheduler_) {
+            global_scheduler_->shutdown();
+        }
     }
 
     bool initialize(int argc, char* argv[]) {
@@ -68,10 +73,19 @@ public:
         // Get server mode from config (set by CLI11 parsing)
         bool server_mode = Config::instance().is_server_mode();
 
+        // Create global Elio scheduler with auto-scaling
+        // Use number of CPU cores as default, can be configured
+        size_t num_threads = config.p2p.worker_threads > 0 ? config.p2p.worker_threads :
+                           std::thread::hardware_concurrency();
+        global_scheduler_ = std::make_shared<elio::runtime::scheduler>(num_threads);
+        global_scheduler_->start();
+        Logger::instance().info("Global Elio scheduler started with " + std::to_string(num_threads) + " threads");
+
         // Initialize control plane server if in server mode
         if (server_mode) {
             Logger::instance().info("Running in control plane server mode");
             control_plane_server_ = std::make_unique<ControlPlaneServer>(config.control_plane_server);
+            control_plane_server_->set_scheduler(global_scheduler_);
         } else {
             // Initialize components for regular node mode
             cache_manager_ = std::make_shared<ChunkManager>(config.cache);
@@ -88,15 +102,22 @@ public:
             storage_client_ = StorageClientFactory::create(config.storage);
             if (!storage_client_) {
                 Logger::instance().warning("Failed to create storage client");
+            } else {
+                storage_client_->set_scheduler(global_scheduler_);
             }
 
             node_discovery_ = std::make_unique<NodeDiscovery>(config.p2p);
+            node_discovery_->set_scheduler(global_scheduler_);
+
             transfer_manager_ = std::make_unique<TransferManager>(config.p2p);
+            transfer_manager_->set_scheduler(global_scheduler_);
 
             // Create proxy server with cache manager and storage client
             proxy_server_ = std::make_unique<ProxyServer>(config.proxy, cache_manager_, storage_client_);
+            proxy_server_->set_scheduler(global_scheduler_);
 
             control_client_ = std::make_unique<ControlPlaneClient>(config.control_plane);
+            control_client_->set_scheduler(global_scheduler_);
         }
 
         Logger::instance().info("ElioP2P initialized successfully");
@@ -184,6 +205,7 @@ public:
     }
 
 private:
+    std::shared_ptr<elio::runtime::scheduler> global_scheduler_;
     std::shared_ptr<ChunkManager> cache_manager_;
     std::shared_ptr<StorageClient> storage_client_;
     std::unique_ptr<NodeDiscovery> node_discovery_;

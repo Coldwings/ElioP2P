@@ -132,6 +132,7 @@ struct ControlPlaneClient::Impl {
     std::function<NodeStatus()> status_provider;
     std::string registered_node_id;
     std::atomic<bool> stop_heartbeat{false};
+    std::shared_ptr<elio::runtime::scheduler> scheduler;
 
     Impl(const ControlPlaneConfig& cfg) : config(cfg) {}
 
@@ -551,6 +552,10 @@ elio::coro::task<std::optional<std::vector<ReplicationCommand>>> ControlPlaneCli
     }
 
     co_return std::nullopt;
+}
+
+void ControlPlaneClient::set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) {
+    impl_->scheduler = scheduler;
 }
 
 } // namespace eliop2p
