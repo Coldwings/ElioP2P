@@ -48,7 +48,7 @@ public:
         }
     }
 
-    bool initialize(int argc, char* argv[], bool server_mode = false) {
+    bool initialize(int argc, char* argv[]) {
         Logger::instance().info("Initializing ElioP2P...");
 
         // Load configuration from environment variables first
@@ -65,8 +65,8 @@ public:
         // Get config (with defaults applied from load_from_env)
         auto& config = Config::instance().get();
 
-        // Store server mode
-        server_mode_ = server_mode;
+        // Get server mode from config (set by CLI11 parsing)
+        bool server_mode = Config::instance().is_server_mode();
 
         // Initialize control plane server if in server mode
         if (server_mode) {
@@ -191,7 +191,6 @@ private:
     std::unique_ptr<ProxyServer> proxy_server_;
     std::unique_ptr<ControlPlaneClient> control_client_;
     std::unique_ptr<ControlPlaneServer> control_plane_server_;
-    bool server_mode_ = false;
 };
 
 int main(int argc, char* argv[]) {
@@ -203,134 +202,18 @@ int main(int argc, char* argv[]) {
     std::cout << "ElioP2P - Distributed P2P Cache Acceleration System" << std::endl;
     std::cout << "Version: 0.1.0" << std::endl;
 
-    // Check for help/version flags before full initialization
-    // CLI11 handles --help and --version automatically when parsing
-    // But we need to detect them early to display the full help with environment variables
-    bool show_help = false;
-    bool show_version = false;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--help" || arg == "-h") {
-            show_help = true;
-        } else if (arg == "--version" || arg == "-v") {
-            show_version = true;
-        }
-    }
-
-    if (show_help) {
-        std::cout << std::endl;
-        std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Options:" << std::endl;
-        std::cout << "  -c, --config <path>       Config file path" << std::endl;
-        std::cout << "  -v, --version             Show version" << std::endl;
-        std::cout << "  -h, --help                Show this help message" << std::endl;
-        std::cout << "  -s, --server              Run as control plane server mode" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Node Options:" << std::endl;
-        std::cout << "  --node-id <id>            Node identifier" << std::endl;
-        std::cout << "  --bind-address <addr>     Bind address (default: 0.0.0.0)" << std::endl;
-        std::cout << "  --http-port <port>        HTTP listen port" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Log Options:" << std::endl;
-        std::cout << "  --log-level <level>       Log level (debug, info, warning, error)" << std::endl;
-        std::cout << "  --log-output <output>     Log output (stdout, stderr, file)" << std::endl;
-        std::cout << "  --log-file <path>         Log file path" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Cache Options:" << std::endl;
-        std::cout << "  --cache-memory-size <MB>   Memory cache size in MB" << std::endl;
-        std::cout << "  --cache-disk-size <MB>    Disk cache size in MB" << std::endl;
-        std::cout << "  --cache-chunk-size <MB>   Chunk size in MB" << std::endl;
-        std::cout << "  --cache-disk-path <path>  Disk cache path" << std::endl;
-        std::cout << "  --cache-eviction-threshold <val>  Eviction threshold (0.0-1.0)" << std::endl;
-        std::cout << "  --cache-eviction-target <val>      Eviction target (0.0-1.0)" << std::endl;
-        std::cout << std::endl;
-        std::cout << "P2P Options:" << std::endl;
-        std::cout << "  --p2p-port <port>         P2P listen port (default: 9000)" << std::endl;
-        std::cout << "  --p2p-max-connections <n> Maximum P2P connections" << std::endl;
-        std::cout << "  --p2p-max-peers <n>       Maximum number of peers" << std::endl;
-        std::cout << "  --p2p-max-upload-speed <Mbps>  Max upload speed (0=unlimited)" << std::endl;
-        std::cout << "  --p2p-max-download-speed <Mbps> Max download speed (0=unlimited)" << std::endl;
-        std::cout << "  --p2p-selection-k <n>     Number of peers to select for transfer" << std::endl;
-        std::cout << "  --p2p-gossip-interval <sec>  Gossip interval in seconds" << std::endl;
-        std::cout << "  --p2p-heartbeat-timeout <sec>  Heartbeat timeout in seconds" << std::endl;
-        std::cout << "  --p2p-transport <type>   Transport type (tcp, rdma)" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Control Plane Options:" << std::endl;
-        std::cout << "  --control-plane-endpoint <url>  Control plane endpoint" << std::endl;
-        std::cout << "  --control-plane-port <port>     Control plane port" << std::endl;
-        std::cout << "  --control-plane-heartbeat <sec> Heartbeat interval (seconds)" << std::endl;
-        std::cout << "  --control-plane-reconnect <sec> Reconnect interval (seconds)" << std::endl;
-        std::cout << "  --control-plane-enable          Enable control plane" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Control Plane Server Options (--server mode):" << std::endl;
-        std::cout << "  --control-server-port <port>    Control plane server listen port (default: 8082)" << std::endl;
-        std::cout << "  --control-server-bind <addr>    Control plane server bind address" << std::endl;
-        std::cout << "  --control-server-timeout <sec>  Heartbeat timeout for nodes" << std::endl;
-        std::cout << "  --control-server-max-nodes <n>  Maximum registered nodes" << std::endl;
-        std::cout << "  --control-server-min-replicas <n>  Minimum replica count per chunk" << std::endl;
-        std::cout << "  --control-server-max-replicas <n>  Maximum replica count per chunk" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Storage Options:" << std::endl;
-        std::cout << "  --storage-type <type>      Storage type (s3, oss)" << std::endl;
-        std::cout << "  --storage-endpoint <url>   Object storage endpoint URL" << std::endl;
-        std::cout << "  --storage-region <region>  Object storage region" << std::endl;
-        std::cout << "  --storage-bucket <bucket>  Object storage bucket" << std::endl;
-        std::cout << "  --storage-access-key <key>  Object storage access key" << std::endl;
-        std::cout << "  --storage-secret-key <key>  Object storage secret key" << std::endl;
-        std::cout << "  --storage-https             Use HTTPS for storage" << std::endl;
-        std::cout << "  --storage-connection-timeout <sec>  Connection timeout (seconds)" << std::endl;
-        std::cout << "  --storage-read-timeout <sec>        Read timeout (seconds)" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Proxy Options:" << std::endl;
-        std::cout << "  --proxy-port <port>        HTTP proxy listen port (default: 8080)" << std::endl;
-        std::cout << "  --proxy-bind-address <addr>  HTTP proxy bind address" << std::endl;
-        std::cout << "  --proxy-max-connections <n> Maximum proxy connections" << std::endl;
-        std::cout << "  --proxy-auth-type <type>  Authentication type (none, basic, token)" << std::endl;
-        std::cout << "  --proxy-auth-token <token> Authentication token" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Environment Variables:" << std::endl;
-        std::cout << "  ELIOP2P_NODE_ID              Node identifier" << std::endl;
-        std::cout << "  ELIOP2P_BIND_ADDRESS        Bind address" << std::endl;
-        std::cout << "  ELIOP2P_LOG_LEVEL           Log level (DEBUG, INFO, WARNING, ERROR)" << std::endl;
-        std::cout << "  ELIOP2P_CACHE_MEMORY_SIZE    Memory cache size (MB)" << std::endl;
-        std::cout << "  ELIOP2P_CACHE_DISK_SIZE     Disk cache size (MB)" << std::endl;
-        std::cout << "  ELIOP2P_P2P_PORT           P2P listen port (default: 9000)" << std::endl;
-        std::cout << "  ELIOP2P_PROXY_PORT          HTTP proxy port (default: 8080)" << std::endl;
-        std::cout << "  ELIOP2P_CONTROL_PLANE       Control plane endpoint" << std::endl;
-        std::cout << "  ELIOP2P_STORAGE_ENDPOINT    Object storage endpoint" << std::endl;
-        std::cout << "  ELIOP2P_STORAGE_REGION     Object storage region" << std::endl;
-        std::cout << std::endl;
-        std::cout << "Example:" << std::endl;
-        std::cout << "  ELIOP2P_STORAGE_ENDPOINT=http://s3.amazonaws.com \\" << std::endl;
-        std::cout << "  ELIOP2P_PROXY_PORT=8080 \\" << std::endl;
-        std::cout << "  " << argv[0] << " --node-id=my-node" << std::endl;
-        return 0;
-    }
-
-    if (show_version) {
-        std::cout << "ElioP2P version 0.1.0" << std::endl;
-        return 0;
-    }
-
     try {
         ElioP2PApplication app;
 
-        // Check for server mode flag
-        bool server_mode = false;
-        for (int i = 1; i < argc; ++i) {
-            std::string arg = argv[i];
-            if (arg == "--server" || arg == "-s") {
-                server_mode = true;
-                break;
-            }
+        // Parse command line - CLI11 handles --help/--version automatically
+        // parse_command_line returns false for --help/--version or errors
+        if (!app.initialize(argc, argv)) {
+            // Help/version messages already printed by CLI11
+            return 0;
         }
 
-        // Parse command line - this may return false for --help/--version or errors
-        if (!app.initialize(argc, argv, server_mode)) {
-            std::cerr << "Failed to initialize application" << std::endl;
-            return 1;
-        }
+        // Get server mode from config (set by CLI11)
+        bool server_mode = Config::instance().is_server_mode();
 
         if (!app.start(server_mode)) {
             std::cerr << "Failed to start application" << std::endl;

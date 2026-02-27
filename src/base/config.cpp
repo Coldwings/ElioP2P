@@ -223,6 +223,21 @@ void Config::override_from_env() {
 bool Config::parse_command_line(int argc, char* argv[]) {
     // Create CLI11 app with description
     CLI::App app{"ElioP2P - Distributed P2P Cache Acceleration System"};
+    app.footer("Environment Variables:\n"
+               "  ELIOP2P_NODE_ID              Node identifier\n"
+               "  ELIOP2P_BIND_ADDRESS        Bind address\n"
+               "  ELIOP2P_LOG_LEVEL           Log level (DEBUG, INFO, WARNING, ERROR)\n"
+               "  ELIOP2P_CACHE_MEMORY_SIZE    Memory cache size (MB)\n"
+               "  ELIOP2P_CACHE_DISK_SIZE     Disk cache size (MB)\n"
+               "  ELIOP2P_P2P_PORT            P2P listen port (default: 9000)\n"
+               "  ELIOP2P_PROXY_PORT          HTTP proxy port (default: 8080)\n"
+               "  ELIOP2P_CONTROL_PLANE       Control plane endpoint\n"
+               "  ELIOP2P_STORAGE_ENDPOINT    Object storage endpoint\n"
+               "  ELIOP2P_STORAGE_REGION      Object storage region\n"
+               "\nExample:\n"
+               "  ELIOP2P_STORAGE_ENDPOINT=http://s3.amazonaws.com \\\n"
+               "  ELIOP2P_PROXY_PORT=8080 \\\n"
+               "  ElioP2P --node-id=my-node");
 
     // Config file option
     std::string config_file;
@@ -230,7 +245,7 @@ bool Config::parse_command_line(int argc, char* argv[]) {
 
     // Node options
     app.add_option("--node-id", config_.node.node_id, "Node identifier");
-    app.add_option("--bind-address", config_.node.bind_address, "Bind address");
+    app.add_option("--bind-address", config_.node.bind_address, "Bind address (default: 0.0.0.0)");
     app.add_option("--http-port", config_.node.http_port, "HTTP listen port");
 
     // Log options
@@ -247,11 +262,11 @@ bool Config::parse_command_line(int argc, char* argv[]) {
     app.add_option("--cache-eviction-target", config_.cache.eviction_target, "Eviction target (0.0-1.0)");
 
     // P2P options
-    app.add_option("--p2p-port", config_.p2p.listen_port, "P2P listen port");
+    app.add_option("--p2p-port", config_.p2p.listen_port, "P2P listen port (default: 9000)");
     app.add_option("--p2p-max-connections", config_.p2p.max_connections, "Maximum P2P connections");
     app.add_option("--p2p-max-peers", config_.p2p.max_peers, "Maximum number of peers");
-    app.add_option("--p2p-max-upload-speed", config_.p2p.max_upload_speed_mbps, "Maximum upload speed (Mbps, 0=unlimited)");
-    app.add_option("--p2p-max-download-speed", config_.p2p.max_download_speed_mbps, "Maximum download speed (Mbps, 0=unlimited)");
+    app.add_option("--p2p-max-upload-speed", config_.p2p.max_upload_speed_mbps, "Max upload speed (Mbps, 0=unlimited)");
+    app.add_option("--p2p-max-download-speed", config_.p2p.max_download_speed_mbps, "Max download speed (Mbps, 0=unlimited)");
     app.add_option("--p2p-selection-k", config_.p2p.selection_k, "Number of peers to select for transfer");
     app.add_option("--p2p-gossip-interval", config_.p2p.gossip_interval_sec, "Gossip interval (seconds)");
     app.add_option("--p2p-heartbeat-timeout", config_.p2p.heartbeat_timeout_sec, "Heartbeat timeout (seconds)");
@@ -260,17 +275,17 @@ bool Config::parse_command_line(int argc, char* argv[]) {
     // Control plane options
     app.add_option("--control-plane-endpoint", config_.control_plane.endpoint, "Control plane endpoint");
     app.add_option("--control-plane-port", config_.control_plane.port, "Control plane port");
-    app.add_option("--control-plane-heartbeat", config_.control_plane.heartbeat_interval_sec, "Control plane heartbeat interval (seconds)");
-    app.add_option("--control-plane-reconnect", config_.control_plane.reconnect_interval_sec, "Control plane reconnect interval (seconds)");
+    app.add_option("--control-plane-heartbeat", config_.control_plane.heartbeat_interval_sec, "Heartbeat interval (seconds)");
+    app.add_option("--control-plane-reconnect", config_.control_plane.reconnect_interval_sec, "Reconnect interval (seconds)");
     app.add_flag("--control-plane-enable", config_.control_plane.enable, "Enable control plane");
 
     // Control plane server options
-    app.add_option("--control-server-port", config_.control_plane_server.listen_port, "Control plane server listen port");
+    app.add_option("--control-server-port", config_.control_plane_server.listen_port, "Control plane server listen port (default: 8082)");
     app.add_option("--control-server-bind", config_.control_plane_server.bind_address, "Control plane server bind address");
-    app.add_option("--control-server-timeout", config_.control_plane_server.heartbeat_timeout_sec, "Control plane server heartbeat timeout (seconds)");
-    app.add_option("--control-server-max-nodes", config_.control_plane_server.max_nodes, "Control plane server max nodes");
-    app.add_option("--control-server-min-replicas", config_.control_plane_server.min_replicas, "Control plane server min replicas per chunk");
-    app.add_option("--control-server-max-replicas", config_.control_plane_server.max_replicas, "Control plane server max replicas per chunk");
+    app.add_option("--control-server-timeout", config_.control_plane_server.heartbeat_timeout_sec, "Heartbeat timeout for nodes (seconds)");
+    app.add_option("--control-server-max-nodes", config_.control_plane_server.max_nodes, "Maximum registered nodes");
+    app.add_option("--control-server-min-replicas", config_.control_plane_server.min_replicas, "Minimum replica count per chunk");
+    app.add_option("--control-server-max-replicas", config_.control_plane_server.max_replicas, "Maximum replica count per chunk");
 
     // Storage options
     app.add_option("--storage-type", config_.storage.type, "Storage type (s3, oss)");
@@ -280,15 +295,18 @@ bool Config::parse_command_line(int argc, char* argv[]) {
     app.add_option("--storage-access-key", config_.storage.access_key, "Object storage access key");
     app.add_option("--storage-secret-key", config_.storage.secret_key, "Object storage secret key");
     app.add_flag("--storage-https", config_.storage.use_https, "Use HTTPS for storage");
-    app.add_option("--storage-connection-timeout", config_.storage.connection_timeout_sec, "Storage connection timeout (seconds)");
-    app.add_option("--storage-read-timeout", config_.storage.read_timeout_sec, "Storage read timeout (seconds)");
+    app.add_option("--storage-connection-timeout", config_.storage.connection_timeout_sec, "Connection timeout (seconds)");
+    app.add_option("--storage-read-timeout", config_.storage.read_timeout_sec, "Read timeout (seconds)");
 
     // Proxy options
-    app.add_option("--proxy-port", config_.proxy.listen_port, "HTTP proxy listen port");
+    app.add_option("--proxy-port", config_.proxy.listen_port, "HTTP proxy listen port (default: 8080)");
     app.add_option("--proxy-bind-address", config_.proxy.bind_address, "HTTP proxy bind address");
     app.add_option("--proxy-max-connections", config_.proxy.max_connections, "Maximum proxy connections");
-    app.add_option("--proxy-auth-type", config_.proxy.auth_type, "Proxy authentication type (none, basic, token)");
-    app.add_option("--proxy-auth-token", config_.proxy.auth_token, "Proxy authentication token");
+    app.add_option("--proxy-auth-type", config_.proxy.auth_type, "Authentication type (none, basic, token)");
+    app.add_option("--proxy-auth-token", config_.proxy.auth_token, "Authentication token");
+
+    // Server mode flag
+    app.add_flag("-s,--server", server_mode_, "Run as control plane server mode");
 
     // Add version option
     app.set_version_flag("-v,--version", "0.1.0");

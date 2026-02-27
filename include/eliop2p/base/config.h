@@ -140,6 +140,9 @@ public:
     // Print configuration (for debugging)
     void print() const;
 
+    // Check if server mode was requested
+    bool is_server_mode() const { return server_mode_; }
+
 private:
     Config() = default;
     Config(const Config&) = delete;
@@ -152,6 +155,7 @@ private:
 
     GlobalConfig config_;
     std::string config_file_;
+    bool server_mode_ = false;
 };
 
 } // namespace eliop2p
