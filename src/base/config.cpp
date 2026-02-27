@@ -13,11 +13,23 @@ namespace eliop2p {
 namespace {
 
 // Log level parsing - used when setting log level from config
+// Supports case-insensitive input (DEBUG, debug, Debug all work)
 static LogLevel parse_log_level(const std::string& level) {
-    if (level == "debug") return elio::log::level::debug;
-    if (level == "info") return elio::log::level::info;
-    if (level == "warning") return elio::log::level::warning;
-    if (level == "error") return elio::log::level::error;
+    // Convert to lowercase for comparison
+    std::string level_lower = level;
+    for (auto& c : level_lower) {
+        c = std::tolower(static_cast<unsigned char>(c));
+    }
+
+    // Trim whitespace
+    auto start = std::find_if(level_lower.begin(), level_lower.end(), [](unsigned char c) { return !std::isspace(c); });
+    auto end = std::find_if(level_lower.rbegin(), level_lower.rend(), [](unsigned char c) { return !std::isspace(c); }).base();
+    level_lower = (start < end) ? std::string(start, end) : level_lower;
+
+    if (level_lower == "debug") return elio::log::level::debug;
+    if (level_lower == "info" || level_lower.empty()) return elio::log::level::info;
+    if (level_lower == "warning" || level_lower == "warn") return elio::log::level::warning;
+    if (level_lower == "error" || level_lower == "err") return elio::log::level::error;
     return elio::log::level::info;
 }
 
@@ -188,6 +200,7 @@ void Config::override_from_env() {
     // Log config
     if (const char* val = std::getenv("ELIOP2P_LOG_LEVEL")) {
         config_.log.level = val;
+        Logger::instance().set_level(parse_log_level(val));
     }
 
     // Control plane
@@ -221,6 +234,12 @@ void Config::override_from_env() {
 }
 
 bool Config::parse_command_line(int argc, char* argv[]) {
+    // Apply log level from environment variable first
+    // This ensures debug output is available during command line parsing
+    if (const char* val = std::getenv("ELIOP2P_LOG_LEVEL")) {
+        Logger::instance().set_level(parse_log_level(val));
+    }
+
     // Create CLI11 app with description
     CLI::App app{"ElioP2P - Distributed P2P Cache Acceleration System"};
     app.footer("Environment Variables:\n"

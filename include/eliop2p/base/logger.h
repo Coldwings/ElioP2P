@@ -72,9 +72,11 @@ public:
     }
 
 private:
-    Logger() = default;
+    Logger();
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
+
+    void init_from_env();
 
     elio::log::logger& logger_ = elio::log::logger::instance();
     elio::log::level level_ = elio::log::level::info;

@@ -194,6 +194,27 @@ private:
 };
 
 int main(int argc, char* argv[]) {
+    // Set up log level from environment variable FIRST, before any logging
+    if (const char* val = std::getenv("ELIOP2P_LOG_LEVEL")) {
+        std::string level_str = val;
+        // Convert to lowercase for comparison
+        for (auto& c : level_str) {
+            c = std::tolower(static_cast<unsigned char>(c));
+        }
+        elio::log::level log_level = elio::log::level::info;
+        if (level_str == "debug") {
+            log_level = elio::log::level::debug;
+        } else if (level_str == "warning" || level_str == "warn") {
+            log_level = elio::log::level::warning;
+        } else if (level_str == "error" || level_str == "err") {
+            log_level = elio::log::level::error;
+        }
+        // Set both Elio logger and our wrapper logger level
+        elio::log::logger::instance().set_level(log_level);
+        // Also set through our Logger wrapper to ensure consistency
+        Logger::instance().set_level(log_level);
+    }
+
     // Set up signal handlers for graceful shutdown
     // Note: Don't block signals globally as this interferes with elio::serve()
     std::signal(SIGINT, signal_handler);
