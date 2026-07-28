@@ -17,6 +17,28 @@ namespace eliop2p {
 
 namespace fs = std::filesystem;
 
+// Map an arbitrary chunk_id to a safe disk filename. chunk_id is derived
+// from the request URL (or received from a P2P peer) and may contain
+// characters like '/', '.', and '..': without sanitization, persist/load/
+// delete would traverse outside the chunks directory. Sanitization is
+// intentionally NOT reversible - the disk index is built from sanitized
+// names everywhere, so lookups stay consistent across restarts.
+static std::string sanitize_chunk_filename(const std::string& chunk_id) {
+    std::string out;
+    out.reserve(chunk_id.size());
+    for (unsigned char c : chunk_id) {
+        if (std::isalnum(c) || c == '.' || c == '_' || c == '-' || c == '#') {
+            out += static_cast<char>(c);
+        } else {
+            out += '_';
+        }
+    }
+    if (out.empty() || out == "." || out == "..") {
+        out = "_";
+    }
+    return out;
+}
+
 struct ChunkManager::Impl {
     CacheConfig config;
     std::unique_ptr<LRUCache> memory_cache;
@@ -50,7 +72,7 @@ struct ChunkManager::Impl {
         if (disk_cache_path.empty()) return false;
 
         try {
-            fs::path chunk_path = fs::path(disk_cache_path) / "chunks" / (chunk_id + ".chunk");
+            fs::path chunk_path = fs::path(disk_cache_path) / "chunks" / (sanitize_chunk_filename(chunk_id) + ".chunk");
             fs::create_directories(chunk_path.parent_path());
 
             std::ofstream file(chunk_path, std::ios::binary);
@@ -72,7 +94,7 @@ struct ChunkManager::Impl {
         if (disk_cache_path.empty()) return std::nullopt;
 
         try {
-            fs::path chunk_path = fs::path(disk_cache_path) / "chunks" / (chunk_id + ".chunk");
+            fs::path chunk_path = fs::path(disk_cache_path) / "chunks" / (sanitize_chunk_filename(chunk_id) + ".chunk");
             if (!fs::exists(chunk_path)) {
                 return std::nullopt;
             }
@@ -101,7 +123,7 @@ struct ChunkManager::Impl {
         if (disk_cache_path.empty()) return false;
 
         try {
-            fs::path chunk_path = fs::path(disk_cache_path) / "chunks" / (chunk_id + ".chunk");
+            fs::path chunk_path = fs::path(disk_cache_path) / "chunks" / (sanitize_chunk_filename(chunk_id) + ".chunk");
             if (fs::exists(chunk_path)) {
                 fs::remove(chunk_path);
             }
