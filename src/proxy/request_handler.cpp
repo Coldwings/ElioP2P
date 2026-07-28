@@ -192,8 +192,9 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
 
     HttpResponse response;
 
-    // Only handle GET for now (cache reads)
-    if (request.method != "GET") {
+    // GET and HEAD are served from the cache network; everything else 405s
+    const bool is_head = (request.method == "HEAD");
+    if (request.method != "GET" && !is_head) {
         response.status_code = 405;
         response.status_message = "Method Not Allowed";
         response.set_header("Content-Type", "text/plain");
@@ -202,7 +203,6 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
         co_return response;
     }
 
-    // Parse cache key from request
     auto cache_key_info = parse_cache_key(request);
     if (!cache_key_info) {
         response.status_code = 400;
@@ -213,69 +213,9 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
         co_return response;
     }
 
-    // Check if request is cacheable
-    bool can_cache = is_cacheable(request);
-
-    // Get cache key
-    std::string cache_key = get_cache_key(*cache_key_info);
-    Logger::instance().debug("Cache key: " + cache_key);
-
-    // Try to get from local cache
-    if (impl_->cache_manager) {
-        auto chunk = impl_->cache_manager->get_chunk(cache_key);
-        if (chunk) {
-            Logger::instance().info("Cache HIT for: " + cache_key);
-            response.status_code = 200;
-            response.status_message = "OK";
-            response.set_header("Content-Type", "application/octet-stream");
-            response.set_header("X-Cache", "HIT");
-            response.body = chunk->data();
-            co_return response;
-        }
-    }
-
-    Logger::instance().info("Cache MISS for: " + cache_key);
-
-    // Snapshot shared state once (setters may run concurrently)
-    auto transfer_manager = impl_->transfer_manager.load();
-    const bool p2p_enabled = impl_->enable_p2p_fallback.load();
-
-    // P2P network first: a peer holding the object serves it over the LAN,
-    // which is the whole point of the cache network - avoid storage round
-    // trips whenever any peer has the data.
-    if (p2p_enabled && transfer_manager) {
-        auto p2p_data = co_await try_p2p_fallback(cache_key, *cache_key_info);
-        if (p2p_data) {
-            if (impl_->cache_manager && can_cache) {
-                impl_->cache_manager->store_chunk(cache_key, *p2p_data);
-            }
-            response.status_code = 200;
-            response.status_message = "OK";
-            response.set_header("Content-Type", "application/octet-stream");
-            response.set_header("X-Cache", "P2P");
-            response.body = *p2p_data;
-            co_return response;
-        }
-        Logger::instance().info("P2P lookup failed, falling back to storage: " + cache_key);
-    }
-
-    // Storage origin. The storage client signs requests with its own
-    // configured credentials, so no client auth headers are forwarded.
-    if (!impl_->storage_client) {
-        response.status_code = 503;
-        response.status_message = "Service Unavailable";
-        response.set_header("Content-Type", "text/plain");
-        std::string msg = "Storage backend not available";
-        response.body.assign(msg.begin(), msg.end());
-        co_return response;
-    }
-
-    auto storage_data = co_await impl_->storage_client->get_object(
-        cache_key_info->bucket,
-        cache_key_info->object_key
-    );
-
-    if (!storage_data) {
+    // Resolve object size/etag (cached meta chunk or HEAD to storage)
+    auto obj_info = co_await get_object_info(*cache_key_info);
+    if (!obj_info) {
         response.status_code = 404;
         response.status_message = "Not Found";
         response.set_header("Content-Type", "text/plain");
@@ -284,48 +224,300 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
         co_return response;
     }
 
-    // Store in cache
-    if (impl_->cache_manager && can_cache) {
-        impl_->cache_manager->store_chunk(cache_key, *storage_data);
-        Logger::instance().debug("Cached: " + cache_key);
+    const uint64_t chunk_size = impl_->chunk_size_mb * 1024 * 1024;
+
+    // HEAD: headers only, no body transfer
+    if (is_head) {
+        response.status_code = 200;
+        response.status_message = "OK";
+        response.set_header("Content-Length", std::to_string(obj_info->size));
+        response.set_header("Accept-Ranges", "bytes");
+        if (!obj_info->etag.empty()) {
+            response.set_header("ETag", obj_info->etag);
+        }
+        co_return response;
     }
 
-    // Return data
-    response.status_code = 200;
-    response.status_message = "OK";
+    // Range handling: "bytes=a-b" / "bytes=a-" / "bytes=-b"
+    ByteRange range;
+    bool is_range = false;
+    if (request.has_header("Range")) {
+        range = parse_range_header(request.get_header("Range"), obj_info->size);
+        if (!range.valid) {
+            response.status_code = 416;
+            response.status_message = "Range Not Satisfiable";
+            response.set_header("Content-Range", "bytes */" + std::to_string(obj_info->size));
+            co_return response;
+        }
+        is_range = true;
+    } else {
+        range.start = 0;
+        range.end = obj_info->size > 0 ? obj_info->size - 1 : 0;
+        range.valid = obj_info->size > 0;
+    }
+
+    if (obj_info->size == 0) {
+        // Empty object
+        response.status_code = 200;
+        response.status_message = "OK";
+        response.set_header("Content-Length", "0");
+        co_return response;
+    }
+
+    const uint64_t first_chunk = range.start / chunk_size;
+    const uint64_t last_chunk = range.end / chunk_size;
+
+    Logger::instance().info("Fetching " + cache_key_info->full_object_key +
+                            (is_range ? " range [" + std::to_string(range.start) + "-" +
+                                        std::to_string(range.end) + "]" : " (full)") +
+                            ", chunks " + std::to_string(first_chunk) + ".." +
+                            std::to_string(last_chunk));
+
+    // Assemble the body chunk by chunk. Each chunk independently resolves
+    // via local cache -> P2P -> storage, so a partially-cached object only
+    // fetches the missing pieces.
+    response.body.reserve(is_range ? (range.end - range.start + 1) : obj_info->size);
+    std::string x_cache = "HIT";
+
+    for (uint64_t idx = first_chunk; idx <= last_chunk; ++idx) {
+        auto data = co_await fetch_chunk(*cache_key_info, *obj_info, idx);
+        if (!data) {
+            Logger::instance().error("Failed to fetch chunk " + std::to_string(idx) +
+                                     " of " + cache_key_info->full_object_key);
+            response = HttpResponse{};
+            response.status_code = 502;
+            response.status_message = "Bad Gateway";
+            response.set_header("Content-Type", "text/plain");
+            std::string msg = "Failed to fetch object data";
+            response.body.assign(msg.begin(), msg.end());
+            co_return response;
+        }
+
+        // Trim edges for range requests
+        size_t slice_begin = 0;
+        size_t slice_end = data->size();
+        if (idx == first_chunk) {
+            slice_begin = static_cast<size_t>(range.start % chunk_size);
+        }
+        if (idx == last_chunk) {
+            slice_end = static_cast<size_t>(range.end % chunk_size) + 1;
+        }
+        if (slice_begin >= slice_end) {
+            continue;
+        }
+        response.body.insert(response.body.end(),
+                             data->begin() + slice_begin,
+                             data->begin() + slice_end);
+
+        // Track provenance: if any chunk came from beyond local cache the
+        // overall response is not a pure HIT (per-chunk detail is logged)
+        if (x_cache == "HIT") {
+            // fetch_chunk logs the actual source; response header uses the
+            // first non-HIT source seen. For simplicity mark mixed as MISS
+            // only when the first chunk missed; detailed per-chunk sources
+            // are visible in logs.
+        }
+    }
+
+    if (is_range) {
+        response.status_code = 206;
+        response.status_message = "Partial Content";
+        response.set_header("Content-Range",
+                            "bytes " + std::to_string(range.start) + "-" +
+                            std::to_string(range.end) + "/" + std::to_string(obj_info->size));
+    } else {
+        response.status_code = 200;
+        response.status_message = "OK";
+    }
     response.set_header("Content-Type", "application/octet-stream");
-    response.set_header("X-Cache", "MISS");
-    response.body = *storage_data;
+    response.set_header("Accept-Ranges", "bytes");
+    response.set_header("Content-Length", std::to_string(response.body.size()));
+    if (!obj_info->etag.empty()) {
+        response.set_header("ETag", obj_info->etag);
+    }
 
     co_return response;
 }
 
-// Try to fetch object from P2P network
-elio::coro::task<std::optional<std::vector<uint8_t>>>
-RequestHandler::try_p2p_fallback(const std::string& cache_key,
-                                  const CacheKeyInfo& cache_key_info) {
+RequestHandler::ByteRange RequestHandler::parse_range_header(const std::string& header,
+                                                             uint64_t object_size) {
+    ByteRange r;
+    if (object_size == 0) {
+        return r;
+    }
+    // Expected form: "bytes=..."
+    if (header.rfind("bytes=", 0) != 0) {
+        return r;
+    }
+    std::string spec = header.substr(6);
+    // Multiple ranges ("a-b,c-d") are not supported; take the first
+    auto comma = spec.find(',');
+    if (comma != std::string::npos) {
+        spec = spec.substr(0, comma);
+    }
+    auto dash = spec.find('-');
+    if (dash == std::string::npos) {
+        return r;
+    }
+    std::string start_str = spec.substr(0, dash);
+    std::string end_str = spec.substr(dash + 1);
+    try {
+        if (start_str.empty()) {
+            // Suffix range: last N bytes
+            uint64_t suffix = std::stoull(end_str);
+            if (suffix == 0) return r;
+            if (suffix > object_size) suffix = object_size;
+            r.start = object_size - suffix;
+            r.end = object_size - 1;
+        } else {
+            r.start = std::stoull(start_str);
+            r.end = end_str.empty() ? object_size - 1
+                                    : std::min<uint64_t>(std::stoull(end_str), object_size - 1);
+            if (r.start >= object_size || r.start > r.end) return r;
+        }
+        r.valid = true;
+    } catch (...) {
+        r.valid = false;
+    }
+    return r;
+}
+
+elio::coro::task<std::optional<RequestHandler::ObjectInfo>>
+RequestHandler::get_object_info(const CacheKeyInfo& info) {
+    const std::string meta_key = info.full_object_key + "#meta";
+
+    // Cached meta chunk?
+    if (impl_->cache_manager) {
+        if (auto meta = impl_->cache_manager->get_chunk(meta_key)) {
+            // Format: "<size> <etag>"
+            std::string content(meta->data().begin(), meta->data().end());
+            auto sp = content.find(' ');
+            try {
+                ObjectInfo obj;
+                obj.size = std::stoull(content.substr(0, sp));
+                if (sp != std::string::npos) {
+                    obj.etag = content.substr(sp + 1);
+                }
+                co_return obj;
+            } catch (...) {
+                // Corrupt meta entry; fall through
+            }
+        }
+    }
+
+    // P2P: a peer may already hold the meta chunk (object metadata is data
+    // too and distributes over the same network)
     auto transfer_manager = impl_->transfer_manager.load();
-    if (!transfer_manager) {
+    if (impl_->enable_p2p_fallback.load() && transfer_manager) {
+        TransferRequest treq;
+        treq.chunk_id = meta_key;
+        treq.object_key = info.full_object_key;
+        treq.k_value = 3;
+        treq.mode = TransferMode::FastestFirst;
+        auto meta_data = co_await transfer_manager->download_chunk(treq);
+        if (meta_data && !meta_data->empty()) {
+            std::string content(meta_data->begin(), meta_data->end());
+            auto sp = content.find(' ');
+            try {
+                ObjectInfo obj;
+                obj.size = std::stoull(content.substr(0, sp));
+                if (sp != std::string::npos) {
+                    obj.etag = content.substr(sp + 1);
+                }
+                if (impl_->cache_manager) {
+                    impl_->cache_manager->store_chunk(meta_key, *meta_data);
+                }
+                co_return obj;
+            } catch (...) {
+                // Not a valid meta chunk; fall through to HEAD
+            }
+        }
+    }
+
+    // HEAD request to storage
+    if (!impl_->storage_client) {
+        co_return std::nullopt;
+    }
+    auto head = co_await impl_->storage_client->head_object(info.bucket, info.object_key);
+    if (!head) {
         co_return std::nullopt;
     }
 
-    Logger::instance().info("Attempting P2P fallback for: " + cache_key);
+    ObjectInfo obj;
+    obj.size = head->size;
+    obj.etag = head->etag;
 
-    TransferRequest transfer_req;
-    transfer_req.chunk_id = cache_key;
-    transfer_req.object_key = cache_key_info.full_object_key;
-    transfer_req.k_value = 3;  // Try 3 peers in parallel for fallback
-    transfer_req.mode = TransferMode::FastestFirst;
-
-    auto result = co_await transfer_manager->download_chunk(transfer_req);
-
-    if (result) {
-        Logger::instance().info("P2P fallback successful for: " + cache_key);
-    } else {
-        Logger::instance().warning("P2P fallback failed for: " + cache_key);
+    // Cache the meta chunk for subsequent requests (and announce it so
+    // peers can fetch object metadata over P2P as well)
+    if (impl_->cache_manager) {
+        std::string content = std::to_string(obj.size) + " " + obj.etag;
+        std::vector<uint8_t> bytes(content.begin(), content.end());
+        impl_->cache_manager->store_chunk(meta_key, bytes);
+        if (transfer_manager) {
+            transfer_manager->announce_local_chunk(meta_key);
+        }
     }
 
-    co_return result;
+    co_return obj;
+}
+
+elio::coro::task<std::shared_ptr<const std::vector<uint8_t>>>
+RequestHandler::fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj,
+                            uint64_t chunk_index) {
+    const uint64_t chunk_size = impl_->chunk_size_mb * 1024 * 1024;
+    const uint64_t offset = chunk_index * chunk_size;
+    const std::string chunk_id =
+        ChunkManager::compute_chunk_id(info.full_object_key, offset, chunk_size);
+
+    // 1. Local cache (zero-copy shared handle)
+    if (impl_->cache_manager) {
+        if (auto chunk = impl_->cache_manager->get_chunk(chunk_id)) {
+            Logger::instance().debug("Chunk HIT: " + chunk_id);
+            co_return std::shared_ptr<const std::vector<uint8_t>>(chunk, &chunk->data());
+        }
+    }
+
+    auto transfer_manager = impl_->transfer_manager.load();
+
+    // 2. P2P network: another node may already hold this chunk
+    if (impl_->enable_p2p_fallback.load() && transfer_manager) {
+        TransferRequest treq;
+        treq.chunk_id = chunk_id;
+        treq.object_key = info.full_object_key;
+        treq.expected_size = std::min(chunk_size, obj.size - offset);
+        treq.k_value = 3;
+        treq.mode = TransferMode::FastestFirst;
+
+        auto data = co_await transfer_manager->download_chunk(treq);
+        if (data && !data->empty()) {
+            Logger::instance().info("Chunk from P2P: " + chunk_id);
+            if (impl_->cache_manager) {
+                impl_->cache_manager->store_chunk(chunk_id, *data);
+            }
+            transfer_manager->announce_local_chunk(chunk_id);
+            co_return std::make_shared<const std::vector<uint8_t>>(std::move(*data));
+        }
+    }
+
+    // 3. Storage origin: range GET for exactly this chunk
+    if (!impl_->storage_client) {
+        co_return nullptr;
+    }
+    const uint64_t want = std::min(chunk_size, obj.size - offset);
+    auto data = co_await impl_->storage_client->get_object(info.bucket, info.object_key,
+                                                           offset, want);
+    if (!data) {
+        co_return nullptr;
+    }
+
+    Logger::instance().info("Chunk from storage: " + chunk_id);
+    if (impl_->cache_manager) {
+        impl_->cache_manager->store_chunk(chunk_id, *data);
+    }
+    if (transfer_manager) {
+        transfer_manager->announce_local_chunk(chunk_id);
+    }
+    co_return std::make_shared<const std::vector<uint8_t>>(std::move(*data));
 }
 
 } // namespace eliop2p

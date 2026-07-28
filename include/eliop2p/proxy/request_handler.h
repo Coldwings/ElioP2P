@@ -86,9 +86,36 @@ public:
     // Detect authentication type from request
     RequestAuthType detect_auth_type(const HttpRequest& request) const;
 
-    // Try P2P fallback when storage is unavailable
-    elio::coro::task<std::optional<std::vector<uint8_t>>>
-    try_p2p_fallback(const std::string& cache_key, const CacheKeyInfo& cache_key_info);
+    // ---- Chunked object access -------------------------------------------
+    // Objects are split into fixed-size chunks (config chunk_size_mb) keyed
+    // as "<bucket>/<key>_<index>". Each chunk is cached, announced, and
+    // fetched independently, so large objects can be served partially
+    // (HTTP Range) and distributed chunk-by-chunk over P2P.
+
+    struct ObjectInfo {
+        uint64_t size = 0;
+        std::string etag;
+    };
+
+    // Byte range parsed from an HTTP Range header (inclusive start/end).
+    struct ByteRange {
+        uint64_t start = 0;
+        uint64_t end = 0;  // inclusive
+        bool valid = false;
+    };
+
+    // Parse "bytes=a-b", "bytes=a-", "bytes=-b" against the object size.
+    static ByteRange parse_range_header(const std::string& header, uint64_t object_size);
+
+    // Resolve object size/etag: cached meta chunk first, HEAD request to
+    // storage otherwise (the result is then cached as a meta chunk).
+    elio::coro::task<std::optional<ObjectInfo>>
+    get_object_info(const CacheKeyInfo& info);
+
+    // Fetch a single chunk by index: local cache -> P2P -> storage range GET.
+    // Returns the chunk data; nullopt if every source failed.
+    elio::coro::task<std::shared_ptr<const std::vector<uint8_t>>>
+    fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj, uint64_t chunk_index);
 
 private:
     struct Impl;

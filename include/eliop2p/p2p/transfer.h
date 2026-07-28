@@ -226,6 +226,10 @@ public:
     // Set node discovery for querying peers
     void set_node_discovery(NodeDiscovery* discovery);
 
+    // Announce to the P2P network that we now hold a chunk (forwards to
+    // node discovery; no-op if discovery is not wired).
+    void announce_local_chunk(const std::string& chunk_id);
+
     // Get chunk transfer context
     std::shared_ptr<ChunkTransferContext> get_transfer_context(const std::string& chunk_id) const;
 
@@ -237,8 +241,9 @@ public:
     // Set runtime scheduler for TCP server
     void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler);
 
-    // Set callback for when chunk data is needed
-    using ChunkDataProvider = std::function<std::optional<std::vector<uint8_t>>(const std::string& chunk_id)>;
+    // Set callback for when chunk data is needed.
+    // Returns a shared handle so the serving path is zero-copy.
+    using ChunkDataProvider = std::function<std::shared_ptr<const std::vector<uint8_t>>(const std::string& chunk_id)>;
     void set_chunk_data_provider(ChunkDataProvider provider);
 
     // Set callback for storing chunk data received via Upload messages.
