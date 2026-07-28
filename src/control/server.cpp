@@ -12,6 +12,8 @@
 #include <sys/socket.h>
 #include <random>
 #include <sstream>
+#include <algorithm>
+#include <ctime>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -40,8 +42,17 @@ struct ControlPlaneServer::Impl {
     // Chunk location index: chunk_id -> set of node_ids
     std::unordered_map<std::string, std::unordered_set<std::string>> chunk_index;
 
-    // Pending replication commands for each node
-    std::unordered_map<std::string, std::vector<ReplicationCommand>> pending_commands;
+    // Pending replication commands for each node. Commands survive delivery
+    // until explicitly ACKed by the node (or redelivered after timeout).
+    struct PendingCommand {
+        ReplicationCommand cmd;
+        uint64_t delivered_at = 0;  // epoch seconds; 0 = not yet delivered
+    };
+    std::unordered_map<std::string, std::vector<PendingCommand>> pending_commands;
+    uint64_t command_sequence = 0;
+
+    // Redeliver commands that were delivered but never ACKed
+    static constexpr uint64_t COMMAND_ACK_TIMEOUT_SEC = 60;
 
     // Metadata manager for persistent storage
     std::unique_ptr<MetadataManager> metadata_manager;
@@ -55,18 +66,7 @@ struct ControlPlaneServer::Impl {
     // Scheduler for coroutines
     std::shared_ptr<elio::runtime::scheduler> scheduler;
 
-    // Pipe for stop notification
-    int stop_pipe[2] = {-1, -1};
-
-    // Shared pointer to this for lambdas
-    std::shared_ptr<Impl> self;
-
     Impl(const ControlPlaneServerConfig& cfg) : config(cfg) {
-        // Create pipe for stop notification
-        if (pipe(stop_pipe) == -1) {
-            Logger::instance().error("Failed to create stop pipe for control plane server");
-        }
-
         metadata_manager = std::make_unique<MetadataManager>();
     }
 
@@ -77,12 +77,11 @@ struct ControlPlaneServer::Impl {
         return (now - node.last_heartbeat_time) <= config.heartbeat_timeout_sec;
     }
 
-    // Update chunk index when node reports chunks
-    void update_chunk_index(const std::string& node_id,
-                           const std::vector<std::string>& chunk_ids,
-                           bool add) {
-        std::lock_guard<std::mutex> lock(nodes_mutex);
-
+    // Update chunk index when node reports chunks.
+    // Caller MUST hold nodes_mutex.
+    void update_chunk_index_locked(const std::string& node_id,
+                                   const std::vector<std::string>& chunk_ids,
+                                   bool add) {
         if (add) {
             for (const auto& chunk_id : chunk_ids) {
                 chunk_index[chunk_id].insert(node_id);
@@ -98,6 +97,14 @@ struct ControlPlaneServer::Impl {
                 }
             }
         }
+    }
+
+    // Locking entry point for callers that do not already hold nodes_mutex.
+    void update_chunk_index(const std::string& node_id,
+                           const std::vector<std::string>& chunk_ids,
+                           bool add) {
+        std::lock_guard<std::mutex> lock(nodes_mutex);
+        update_chunk_index_locked(node_id, chunk_ids, add);
     }
 };
 
@@ -119,7 +126,7 @@ static json parse_json_body(const elio::http::request& req) {
 }
 
 ControlPlaneServer::ControlPlaneServer(const ControlPlaneServerConfig& config)
-    : impl_(std::make_unique<Impl>(config)) {}
+    : impl_(std::make_shared<Impl>(config)) {}
 
 ControlPlaneServer::~ControlPlaneServer() {
     stop();
@@ -132,8 +139,9 @@ bool ControlPlaneServer::start() {
 
     impl_->running = true;
 
-    // Keep a shared_ptr to impl for the lambdas
-    auto self = std::shared_ptr<Impl>(impl_.get(), [](Impl*){});
+    // Handlers capture the owning shared_ptr so the Impl stays alive for as
+    // long as any in-flight handler coroutine references it.
+    auto self = impl_;
 
     // Create router
     elio::http::router r;
@@ -212,8 +220,8 @@ bool ControlPlaneServer::start() {
                 Logger::instance().info("Registered new node: " + reg.node_id);
             }
 
-            // Update chunk index
-            self->update_chunk_index(reg.node_id, reg.available_chunks, true);
+            // Update chunk index (nodes_mutex already held above)
+            self->update_chunk_index_locked(reg.node_id, reg.available_chunks, true);
 
             // Update metrics
             std::lock_guard<std::mutex> metrics_lock(self->metrics_mutex);
@@ -333,9 +341,9 @@ bool ControlPlaneServer::start() {
                                                elio::http::mime::application_json);
             }
 
-            // Update node's chunk list
-            self->update_chunk_index(node_id, it->second.chunks, false);
-            self->update_chunk_index(node_id, chunk_ids, true);
+            // Update node's chunk list (nodes_mutex already held above)
+            self->update_chunk_index_locked(node_id, it->second.chunks, false);
+            self->update_chunk_index_locked(node_id, chunk_ids, true);
             it->second.chunks = chunk_ids;
 
             std::lock_guard<std::mutex> metrics_lock(self->metrics_mutex);
@@ -520,8 +528,22 @@ bool ControlPlaneServer::start() {
                                            elio::http::mime::application_json);
         }
 
+        // Commands are NOT removed on delivery: a node that crashes after
+        // receiving but before executing would silently lose them. They are
+        // removed only via the ACK endpoint; commands delivered but never
+        // ACKed within the timeout are redelivered here.
+        auto now = static_cast<uint64_t>(std::time(nullptr));
         json commands_json = json::array();
-        for (const auto& cmd : cmd_it->second) {
+        for (auto& pending : cmd_it->second) {
+            if (pending.delivered_at != 0 &&
+                now - pending.delivered_at < Impl::COMMAND_ACK_TIMEOUT_SEC) {
+                // Recently delivered and still within the ACK window:
+                // do not spam the node with duplicates.
+                continue;
+            }
+            pending.delivered_at = now;
+
+            const auto& cmd = pending.cmd;
             json cmd_json;
             cmd_json["command_id"] = cmd.command_id;
             cmd_json["chunk_id"] = cmd.chunk_id;
@@ -533,11 +555,54 @@ bool ControlPlaneServer::start() {
             commands_json.push_back(cmd_json);
         }
 
-        // Clear pending commands after delivery
-        self->pending_commands.erase(cmd_it);
-
         json response = {{"commands", commands_json}};
 
+        co_return elio::http::response(elio::http::status::ok, response.dump(),
+                                       elio::http::mime::application_json);
+    });
+
+    // ACK a replication command: only now is it removed from the pending list
+    r.post("/api/v1/nodes/:node_id/commands/ack", [self](elio::http::context& ctx)
+        -> elio::coro::task<elio::http::response> {
+        auto& req = ctx.req();
+        std::string req_path(req.path());
+        std::string node_id;
+
+        // Parse node_id from path: /api/v1/nodes/{node_id}/commands/ack
+        size_t nodes_pos = req_path.find("/api/v1/nodes/");
+        if (nodes_pos != std::string::npos) {
+            size_t start = nodes_pos + 15;
+            size_t end = req_path.find("/commands/ack", start);
+            if (end != std::string::npos) {
+                node_id = req_path.substr(start, end - start);
+            }
+        }
+
+        json body = parse_json_body(req);
+        std::string command_id = body.value("command_id", "");
+
+        if (node_id.empty() || command_id.empty()) {
+            json error = {{"error", "node_id and command_id are required"}};
+            co_return elio::http::response(elio::http::status::bad_request, error.dump(),
+                                           elio::http::mime::application_json);
+        }
+
+        std::lock_guard<std::mutex> lock(self->nodes_mutex);
+
+        auto cmd_it = self->pending_commands.find(node_id);
+        if (cmd_it != self->pending_commands.end()) {
+            auto& cmds = cmd_it->second;
+            cmds.erase(std::remove_if(cmds.begin(), cmds.end(),
+                                      [&](const Impl::PendingCommand& p) {
+                                          return p.cmd.command_id == command_id;
+                                      }),
+                       cmds.end());
+            if (cmds.empty()) {
+                self->pending_commands.erase(cmd_it);
+            }
+        }
+
+        json response = {{"status", "ok"}};
         co_return elio::http::response(elio::http::status::ok, response.dump(),
                                        elio::http::mime::application_json);
     });
@@ -556,14 +621,18 @@ bool ControlPlaneServer::start() {
 
     // Determine bind address
     elio::net::socket_address bind_addr;
+    elio::net::tcp_options opts;
     if (impl_->config.bind_address == "0.0.0.0") {
+        // IPv4 any-address
+        bind_addr = elio::net::socket_address(elio::net::ipv4_address(impl_->config.listen_port));
+    } else if (impl_->config.bind_address == "::" || impl_->config.bind_address.empty()) {
+        // IPv6 any-address with dual-stack (also accepts IPv4-mapped)
         bind_addr = elio::net::socket_address(elio::net::ipv6_address(impl_->config.listen_port));
+        opts.ipv6_only = false;
     } else {
         bind_addr = elio::net::socket_address(impl_->config.bind_address, impl_->config.listen_port);
+        opts.ipv6_only = (impl_->config.bind_address.find(':') != std::string::npos);
     }
-
-    elio::net::tcp_options opts;
-    opts.ipv6_only = (impl_->config.bind_address != "0.0.0.0");
 
     // Start HTTP server in a separate thread using elio scheduler
     impl_->server_thread = std::thread([this, bind_addr, opts]() {
@@ -605,20 +674,10 @@ void ControlPlaneServer::stop() {
         Logger::instance().info("Stopping control plane server - setting running to false");
         impl_->running = false;
 
-        // Wait for server thread to finish briefly
+        // The server coroutine polls `running` every 100ms and returns after
+        // stopping the HTTP server, so elio::run() exits and the thread ends.
         if (impl_->server_thread.joinable()) {
-            constexpr auto timeout = std::chrono::seconds(1);
-            auto start = std::chrono::steady_clock::now();
-
-            while (impl_->server_thread.joinable()) {
-                auto elapsed = std::chrono::steady_clock::now() - start;
-                if (elapsed >= timeout) {
-                    Logger::instance().warning("Control plane server thread join timeout, detaching");
-                    impl_->server_thread.detach();
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
+            impl_->server_thread.join();
         }
 
         Logger::instance().info("Control plane server stopped");

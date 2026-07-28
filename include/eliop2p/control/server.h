@@ -67,7 +67,9 @@ public:
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    // shared_ptr: HTTP handler coroutines outlive start() and must keep the
+    // Impl alive even if ~ControlPlaneServer runs first.
+    std::shared_ptr<Impl> impl_;
 };
 
 } // namespace eliop2p

@@ -7,6 +7,10 @@
 #include <sstream>
 #include <iostream>
 #include <random>
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <mutex>
 #include <nlohmann/json.hpp>
 
 // Socket includes
@@ -20,6 +24,26 @@
 using json = nlohmann::json;
 
 namespace eliop2p {
+
+namespace {
+
+std::string to_lower(std::string s) {
+    for (auto& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+std::string trim(const std::string& s) {
+    size_t begin = s.find_first_not_of(" \t");
+    if (begin == std::string::npos) {
+        return "";
+    }
+    size_t end = s.find_last_not_of(" \t");
+    return s.substr(begin, end - begin + 1);
+}
+
+} // namespace
 
 // Simple synchronous HTTP client using POSIX sockets
 class SimpleHttpClient {
@@ -82,42 +106,156 @@ public:
             request << body;
         }
 
-        // Send request
+        // Send request (loop to handle partial sends)
         std::string request_str = request.str();
-        ssize_t sent = send(sock, request_str.c_str(), request_str.size(), 0);
-        if (sent < 0) {
-            close(sock);
-            return {500, "Failed to send request"};
+        size_t sent_total = 0;
+        while (sent_total < request_str.size()) {
+            ssize_t n = send(sock, request_str.c_str() + sent_total,
+                             request_str.size() - sent_total, 0);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                close(sock);
+                return {500, "Failed to send request"};
+            }
+            if (n == 0) {
+                close(sock);
+                return {500, "Failed to send request"};
+            }
+            sent_total += static_cast<size_t>(n);
         }
 
-        // Read response
+        // Read the response incrementally: consume the header block first,
+        // then frame the body via Content-Length or Transfer-Encoding:
+        // chunked, falling back to read-until-EOF only when neither is
+        // present.
         std::string response;
         char buffer[4096];
-        while (true) {
-            ssize_t n = recv(sock, buffer, sizeof(buffer) - 1, 0);
-            if (n <= 0) break;
-            buffer[n] = '\0';
-            response += buffer;
+        auto read_more = [&]() -> bool {
+            ssize_t n;
+            do {
+                n = recv(sock, buffer, sizeof(buffer), 0);
+            } while (n < 0 && errno == EINTR);
+            if (n <= 0) return false;
+            response.append(buffer, static_cast<size_t>(n));
+            return true;
+        };
+
+        // Buffer at least `need` bytes; returns false on EOF/error.
+        auto ensure_buffered = [&](size_t need) -> bool {
+            while (response.size() < need) {
+                if (!read_more()) return false;
+            }
+            return true;
+        };
+
+        // Read until the end of the header block.
+        size_t header_end = std::string::npos;
+        while ((header_end = response.find("\r\n\r\n")) == std::string::npos) {
+            if (!read_more()) {
+                close(sock);
+                return {500, "Invalid response: incomplete headers"};
+            }
+        }
+
+        // Parse the status line ("HTTP/1.1 200 OK"); guard against
+        // malformed lines that would make std::stoi throw.
+        int status_code = 500;
+        size_t line_end = response.find("\r\n");
+        try {
+            size_t pos = response.find(' ');
+            if (pos != std::string::npos && pos < line_end) {
+                status_code = std::stoi(response.substr(pos + 1, line_end - pos - 1));
+            }
+        } catch (const std::exception&) {
+            close(sock);
+            return {500, "Invalid response: malformed status line"};
+        }
+
+        // Parse headers with case-insensitive keys.
+        std::unordered_map<std::string, std::string> resp_headers;
+        size_t hpos = (line_end == std::string::npos) ? header_end : line_end + 2;
+        while (hpos < header_end) {
+            size_t hend = response.find("\r\n", hpos);
+            if (hend == std::string::npos || hend > header_end) {
+                hend = header_end;
+            }
+            std::string line = response.substr(hpos, hend - hpos);
+            size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                resp_headers[to_lower(trim(line.substr(0, colon)))] =
+                    trim(line.substr(colon + 1));
+            }
+            hpos = hend + 2;
+        }
+
+        const size_t body_start = header_end + 4;
+        std::string response_body;
+
+        bool chunked = false;
+        auto te_it = resp_headers.find("transfer-encoding");
+        if (te_it != resp_headers.end() &&
+            to_lower(te_it->second).find("chunked") != std::string::npos) {
+            chunked = true;
+        }
+
+        if (chunked) {
+            // Decode chunked transfer-encoding.
+            size_t pos = body_start;
+            while (true) {
+                size_t eol = std::string::npos;
+                while ((eol = response.find("\r\n", pos)) == std::string::npos) {
+                    if (!read_more()) {
+                        close(sock);
+                        return {500, "Invalid response: truncated chunk header"};
+                    }
+                }
+                std::string size_field = response.substr(pos, eol - pos);
+                size_t semi = size_field.find(';');  // ignore chunk extensions
+                if (semi != std::string::npos) {
+                    size_field = size_field.substr(0, semi);
+                }
+                size_t chunk_size = 0;
+                try {
+                    chunk_size = std::stoul(trim(size_field), nullptr, 16);
+                } catch (const std::exception&) {
+                    close(sock);
+                    return {500, "Invalid response: malformed chunk size"};
+                }
+                pos = eol + 2;
+                if (chunk_size == 0) {
+                    // Terminal chunk; trailers (if any) are ignored.
+                    break;
+                }
+                if (!ensure_buffered(pos + chunk_size + 2)) {  // data + CRLF
+                    close(sock);
+                    return {500, "Invalid response: truncated chunk data"};
+                }
+                response_body.append(response, pos, chunk_size);
+                pos += chunk_size + 2;
+            }
+        } else {
+            auto cl_it = resp_headers.find("content-length");
+            if (cl_it != resp_headers.end()) {
+                size_t content_length = 0;
+                try {
+                    content_length = std::stoul(cl_it->second);
+                } catch (const std::exception&) {
+                    close(sock);
+                    return {500, "Invalid response: malformed Content-Length"};
+                }
+                if (!ensure_buffered(body_start + content_length)) {
+                    close(sock);
+                    return {500, "Invalid response: truncated body"};
+                }
+                response_body = response.substr(body_start, content_length);
+            } else {
+                // No framing information: read until the server closes.
+                while (read_more()) {}
+                response_body = response.substr(body_start);
+            }
         }
 
         close(sock);
-
-        // Parse HTTP response
-        size_t header_end = response.find("\r\n\r\n");
-        if (header_end == std::string::npos) {
-            return {500, "Invalid response"};
-        }
-
-        std::string status_line = response.substr(0, response.find("\r\n"));
-        int status_code = 500;
-
-        // Parse status code
-        size_t pos = status_line.find(' ');
-        if (pos != std::string::npos) {
-            status_code = std::stoi(status_line.substr(pos + 1));
-        }
-
-        std::string response_body = response.substr(header_end + 4);
         return {status_code, response_body};
     }
 };
@@ -131,6 +269,8 @@ struct ControlPlaneClient::Impl {
     std::thread heartbeat_thread;
     std::function<NodeStatus()> status_provider;
     std::string registered_node_id;
+    std::mutex node_id_mutex;       // guards registered_node_id
+    std::mutex heartbeat_mutex;     // serializes start/stop of the heartbeat loop
     std::atomic<bool> stop_heartbeat{false};
     std::shared_ptr<elio::runtime::scheduler> scheduler;
 
@@ -223,7 +363,10 @@ bool ControlPlaneClient::register_node(const NodeRegistration& registration) {
 
         if (code == 200 || code == 201) {
             Logger::instance().info("Node registered successfully: " + registration.node_id);
-            impl_->registered_node_id = registration.node_id;
+            {
+                std::lock_guard<std::mutex> lock(impl_->node_id_mutex);
+                impl_->registered_node_id = registration.node_id;
+            }
             return true;
         }
 
@@ -328,13 +471,18 @@ elio::coro::task<std::optional<std::vector<ChunkLocation>>> ControlPlaneClient::
             {"chunk_ids", chunk_ids}
         };
 
-        auto [code, response] = SimpleHttpClient::http_request(
-            impl_->config.endpoint,
-            impl_->config.port,
-            "POST",
-            "/api/v1/chunks/locations",
-            body.dump(),
-            {{"Content-Type", "application/json"}});
+        const std::string endpoint = impl_->config.endpoint;
+        const uint16_t port = impl_->config.port;
+        const std::string request_body = body.dump();
+
+        // Offload the blocking HTTP call to the blocking thread pool so the
+        // scheduler worker thread is not stalled.
+        auto [code, response] = co_await elio::spawn_blocking(
+            [endpoint, port, request_body]() {
+                return SimpleHttpClient::http_request(
+                    endpoint, port, "POST", "/api/v1/chunks/locations",
+                    request_body, {{"Content-Type", "application/json"}});
+            });
 
         if (code == 200) {
             json result = json::parse(response);
@@ -373,11 +521,16 @@ elio::coro::task<std::optional<std::vector<NodeRegistration>>> ControlPlaneClien
     }
 
     try {
-        auto [code, response] = SimpleHttpClient::http_request(
-            impl_->config.endpoint,
-            impl_->config.port,
-            "GET",
-            "/api/v1/nodes");
+        const std::string endpoint = impl_->config.endpoint;
+        const uint16_t port = impl_->config.port;
+
+        // Offload the blocking HTTP call to the blocking thread pool so the
+        // scheduler worker thread is not stalled.
+        auto [code, response] = co_await elio::spawn_blocking(
+            [endpoint, port]() {
+                return SimpleHttpClient::http_request(
+                    endpoint, port, "GET", "/api/v1/nodes");
+            });
 
         if (code == 200) {
             json result = json::parse(response);
@@ -425,11 +578,16 @@ elio::coro::task<std::optional<ControlPlaneMetrics>> ControlPlaneClient::get_met
     }
 
     try {
-        auto [code, response] = SimpleHttpClient::http_request(
-            impl_->config.endpoint,
-            impl_->config.port,
-            "GET",
-            "/api/v1/metrics");
+        const std::string endpoint = impl_->config.endpoint;
+        const uint16_t port = impl_->config.port;
+
+        // Offload the blocking HTTP call to the blocking thread pool so the
+        // scheduler worker thread is not stalled.
+        auto [code, response] = co_await elio::spawn_blocking(
+            [endpoint, port]() {
+                return SimpleHttpClient::http_request(
+                    endpoint, port, "GET", "/api/v1/metrics");
+            });
 
         if (code == 200) {
             json result = json::parse(response);
@@ -455,41 +613,53 @@ bool ControlPlaneClient::is_connected() const {
 }
 
 void ControlPlaneClient::start_heartbeat_loop(const std::function<NodeStatus()>& status_provider) {
-    if (impl_->heartbeat_running.load()) {
+    std::lock_guard<std::mutex> lock(impl_->heartbeat_mutex);
+
+    // Atomic check-and-set: only one concurrent caller may start the loop.
+    if (impl_->heartbeat_running.exchange(true)) {
         Logger::instance().warning("Heartbeat loop already running");
         return;
     }
 
     impl_->status_provider = status_provider;
     impl_->stop_heartbeat = false;
-    impl_->heartbeat_running = true;
 
-    impl_->heartbeat_thread = std::thread([this]() {
-        Logger::instance().info("Heartbeat loop started");
+    // Clamp the interval: 0 would degrade the loop into a busy wait.
+    const uint32_t interval_sec = std::max<uint32_t>(impl_->config.heartbeat_interval_sec, 1);
 
-        while (!impl_->stop_heartbeat.load()) {
-            try {
-                if (impl_->status_provider && impl_->connected.load()) {
-                    NodeStatus status = impl_->status_provider();
-                    send_heartbeat(status);
+    try {
+        impl_->heartbeat_thread = std::thread([this, interval_sec]() {
+            Logger::instance().info("Heartbeat loop started");
+
+            while (!impl_->stop_heartbeat.load()) {
+                try {
+                    if (impl_->status_provider && impl_->connected.load()) {
+                        NodeStatus status = impl_->status_provider();
+                        send_heartbeat(status);
+                    }
+
+                    // Sleep for the configured interval (at least 1 second)
+                    std::this_thread::sleep_for(std::chrono::seconds(interval_sec));
+
+                } catch (const std::exception& e) {
+                    Logger::instance().error("Error in heartbeat loop: " + std::string(e.what()));
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
                 }
-
-                // Sleep for the configured interval
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(impl_->config.heartbeat_interval_sec));
-
-            } catch (const std::exception& e) {
-                Logger::instance().error("Error in heartbeat loop: " + std::string(e.what()));
-                std::this_thread::sleep_for(std::chrono::seconds(5));
             }
-        }
 
-        Logger::instance().info("Heartbeat loop stopped");
+            Logger::instance().info("Heartbeat loop stopped");
+            // Note: heartbeat_running is cleared by stop_heartbeat_loop()
+            // after joining this thread, never from within the thread itself.
+        });
+    } catch (...) {
         impl_->heartbeat_running = false;
-    });
+        throw;
+    }
 }
 
 void ControlPlaneClient::stop_heartbeat_loop() {
+    std::lock_guard<std::mutex> lock(impl_->heartbeat_mutex);
+
     if (!impl_->heartbeat_running.load()) {
         return;
     }
@@ -510,16 +680,27 @@ elio::coro::task<std::optional<std::vector<ReplicationCommand>>> ControlPlaneCli
         co_return std::nullopt;
     }
 
-    if (impl_->registered_node_id.empty()) {
+    std::string node_id;
+    {
+        std::lock_guard<std::mutex> lock(impl_->node_id_mutex);
+        node_id = impl_->registered_node_id;
+    }
+    if (node_id.empty()) {
         co_return std::nullopt;
     }
 
     try {
-        auto [code, response] = SimpleHttpClient::http_request(
-            impl_->config.endpoint,
-            impl_->config.port,
-            "GET",
-            "/api/v1/nodes/" + impl_->registered_node_id + "/commands");
+        const std::string endpoint = impl_->config.endpoint;
+        const uint16_t port = impl_->config.port;
+
+        // Offload the blocking HTTP call to the blocking thread pool so the
+        // scheduler worker thread is not stalled.
+        auto [code, response] = co_await elio::spawn_blocking(
+            [endpoint, port, node_id]() {
+                return SimpleHttpClient::http_request(
+                    endpoint, port, "GET",
+                    "/api/v1/nodes/" + node_id + "/commands");
+            });
 
         if (code == 200) {
             json result = json::parse(response);
@@ -542,6 +723,33 @@ elio::coro::task<std::optional<std::vector<ReplicationCommand>>> ControlPlaneCli
             if (!commands.empty()) {
                 Logger::instance().info("Received " + std::to_string(commands.size()) +
                                         " replication commands");
+
+                // The batch parsed successfully; acknowledge each command so
+                // the server stops redelivering it.
+                std::vector<std::string> command_ids;
+                for (const auto& cmd : commands) {
+                    if (!cmd.command_id.empty()) {
+                        command_ids.push_back(cmd.command_id);
+                    }
+                }
+                if (!command_ids.empty()) {
+                    co_await elio::spawn_blocking(
+                        [endpoint, port, node_id, command_ids]() {
+                            for (const auto& id : command_ids) {
+                                json ack_body = {{"command_id", id}};
+                                const auto ack_result = SimpleHttpClient::http_request(
+                                    endpoint, port, "POST",
+                                    "/api/v1/nodes/" + node_id + "/commands/ack",
+                                    ack_body.dump(),
+                                    {{"Content-Type", "application/json"}});
+                                if (ack_result.first != 200 && ack_result.first != 204) {
+                                    Logger::instance().warning(
+                                        "Failed to ack replication command " + id +
+                                        ", code: " + std::to_string(ack_result.first));
+                                }
+                            }
+                        });
+                }
             }
 
             co_return commands;
