@@ -65,10 +65,38 @@ struct NodeDiscovery::Impl {
         last_cleanup = std::chrono::steady_clock::now();
     }
 
-    // Generate message ID for deduplication
+    // Generate message ID for deduplication. The id MUST include content:
+    // keying only on (source, timestamp, type) falsely collapses two
+    // distinct ChunkAnnounce messages emitted within the same millisecond
+    // (e.g. a meta chunk and a data chunk announced back-to-back), silently
+    // dropping one of them.
     std::string generate_message_id(const GossipMessage& msg) {
+        // FNV-1a over type + content so identical rebroadcasts dedupe while
+        // distinct payloads never collide
+        uint64_t hash = 1469598103934665603ULL;
+        auto mix = [&hash](const void* data, size_t len) {
+            const auto* p = static_cast<const uint8_t*>(data);
+            for (size_t i = 0; i < len; ++i) {
+                hash ^= p[i];
+                hash *= 1099511628211ULL;
+            }
+        };
+        uint32_t t = static_cast<uint32_t>(msg.type);
+        mix(&t, sizeof(t));
+        mix(msg.source_node_id.data(), msg.source_node_id.size());
+        for (const auto& [node_id, chunks] : msg.chunk_map) {
+            mix(node_id.data(), node_id.size());
+            for (const auto& chunk : chunks) {
+                mix(chunk.data(), chunk.size());
+            }
+        }
+        for (const auto& [node_id, peer] : msg.peer_updates) {
+            (void)peer;
+            mix(node_id.data(), node_id.size());
+        }
+
         std::stringstream ss;
-        ss << msg.source_node_id << ":" << msg.timestamp << ":" << static_cast<int>(msg.type);
+        ss << msg.source_node_id << ":" << msg.timestamp << ":" << std::hex << hash;
         return ss.str();
     }
 
