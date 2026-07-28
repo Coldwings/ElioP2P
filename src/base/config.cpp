@@ -221,6 +221,12 @@ void Config::override_from_env() {
     if (const char* val = std::getenv("ELIOP2P_STORAGE_BUCKET")) {
         config_.storage.bucket = val;
     }
+    if (const char* val = std::getenv("ELIOP2P_STORAGE_ACCESS_KEY")) {
+        config_.storage.access_key = val;
+    }
+    if (const char* val = std::getenv("ELIOP2P_STORAGE_SECRET_KEY")) {
+        config_.storage.secret_key = val;
+    }
 
     // P2P
     if (const char* val = std::getenv("ELIOP2P_P2P_PORT")) {

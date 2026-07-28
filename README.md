@@ -1,96 +1,50 @@
 # ElioP2P
 
-Distributed P2P cache acceleration system for large-scale clusters.
+Distributed P2P cache acceleration for object storage: the first node to
+read an object backhauls it from S3; every other node fetches it over the
+LAN from that peer. Chunked (16MB) caching with on-demand partial reads,
+hedged P2P downloads, and origin-anchored integrity verification.
 
-## Overview
+Built on the [Elio](https://github.com/Coldwings/Elio) C++20 coroutine
+framework.
 
-ElioP2P is a distributed P2P cache acceleration system designed to speed up data loading from object storage in large-scale clusters. It leverages cluster network, memory, and disk resources to provide distributed caching and P2P transfer capabilities.
+## Quick start
 
-## Features
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
-- **Multi-tier Caching**: L1 memory cache (LRU), L2 SSD cache, L3 object storage
-- **P2P Transfer**: Node discovery, resumable transfer, parallel download, K-selection
-- **Storage Support**: S3-compatible (AWS S3, MinIO) and Alibaba Cloud OSS
-- **HTTP Proxy**: Transparent caching with authentication passthrough
-- **Control Plane**: Node registration, heartbeat, metadata query, replication adjustment
+# one node against a local MinIO
+ELIOP2P_STORAGE_ENDPOINT=http://localhost:9090 \
+ELIOP2P_STORAGE_ACCESS_KEY=minioadmin \
+ELIOP2P_STORAGE_SECRET_KEY=minioadmin123 \
+./build/bin/ElioP2P --proxy-port 8080 --p2p-port 9000 --p2p-gossip-port 9001
 
-## Architecture
-
+curl http://localhost:8080/test-bucket/some/object -O
 ```
-+-------------------+
-|  HTTP Proxy      |  Port 8080
-+--------+----------+
-         |
-+--------v----------+
-|  Cache Manager   |  L1: Memory (4-16GB)
-|  Chunk Manager   |  L2: SSD (100-500GB)
-+--------+----------+
-         |
-+--------v----------+
-|  P2P Transfer   |  TCP (no UDP)
-|  Node Discovery |  Port 9000
-+--------+----------+
-         |
-+--------v----------+
-|  Control Plane  |
-|  Client         |
-+--------+----------+
-         |
-+--------v----------+
-|  Object Storage |
-|  (S3/OSS)       |
-+-------------------+
-```
+
+Watch `X-Cache` and `X-Chunk-Sources` response headers to see which tier
+(memory / P2P / origin) served each chunk.
+
+## Documentation
+
+Full docs in [docs/](docs/README.md):
+
+- [Architecture](docs/Architecture.md) — components, data flow, threading, trust model
+- [API Contracts](docs/API-Contracts.md) — responsibility boundaries per interface
+- [Protocols](docs/Protocols.md) — chunk transfer, gossip, control plane, proxy HTTP
+- [API Reference](docs/API-Reference.md) — public signatures
+- [Deployment](docs/Deployment.md) — single node, cluster, systemd, Kubernetes
+- [Configuration](docs/Configuration.md) — env vars, CLI, defaults
+- [Security](docs/Security.md) — trust root, poisoning defense, boundaries
+- [Performance Tuning](docs/Performance-Tuning.md)
+- [Testing](docs/Testing.md) — unit tests + real-MinIO E2E
+- [Development](docs/Development.md) — build, code map, pitfalls
 
 ## Requirements
 
-- C++20 compatible compiler
-- CMake 3.20+
-- Elio coroutine framework
-- OpenSSL (for TLS)
-- liburing (optional, for async I/O)
-
-## Build
-
-```bash
-mkdir build && cd build
-cmake ..
-make
-```
-
-## Run
-
-```bash
-./bin/ElioP2P --help
-```
-
-## Configuration
-
-Configuration can be provided via:
-- Config file (INI format)
-- Environment variables
-- Command line arguments
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| ELIOP2P_NODE_ID | Node identifier |
-| ELIOP2P_BIND_ADDRESS | Bind address |
-| ELIOP2P_LOG_LEVEL | Log level (DEBUG, INFO, WARNING, ERROR) |
-| ELIOP2P_CONTROL_PLANE | Control plane endpoint |
-| ELIOP2P_STORAGE_ENDPOINT | Object storage endpoint |
-| ELIOP2P_P2P_PORT | P2P listen port |
-| ELIOP2P_PROXY_PORT | HTTP proxy port |
-
-## Modules
-
-- **base**: Logger, Config, Error codes
-- **cache**: LRU cache, Chunk manager
-- **p2p**: Node discovery, Transfer manager
-- **control**: Control plane client
-- **proxy**: HTTP proxy server
-- **storage**: S3/OSS client
+- Linux (io_uring preferred; epoll fallback)
+- GCC 12+ or Clang 15+ (C++20), CMake 3.20+
+- OpenSSL development files
 
 ## License
 
