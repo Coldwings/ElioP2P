@@ -109,8 +109,25 @@ public:
             node_discovery_ = std::make_unique<NodeDiscovery>(config.p2p);
             node_discovery_->set_scheduler(global_scheduler_);
 
-            transfer_manager_ = std::make_unique<TransferManager>(config.p2p);
+            transfer_manager_ = std::make_shared<TransferManager>(config.p2p);
             transfer_manager_->set_scheduler(global_scheduler_);
+
+            // Wire chunk serving: other peers download from our cache, and
+            // chunks pushed to us (Upload) land in our cache. Without these
+            // callbacks the P2P server side can never serve or accept data.
+            transfer_manager_->set_chunk_manager(cache_manager_.get());
+            transfer_manager_->set_chunk_data_provider(
+                [cm = cache_manager_](const std::string& chunk_id)
+                    -> std::optional<std::vector<uint8_t>> {
+                    auto chunk = cm->get_chunk(chunk_id);
+                    if (!chunk) return std::nullopt;
+                    return std::move(chunk->data());
+                });
+            transfer_manager_->set_chunk_data_consumer(
+                [cm = cache_manager_](const std::string& chunk_id,
+                                      const std::vector<uint8_t>& data) {
+                    return cm->store_chunk(chunk_id, data);
+                });
 
             // Create proxy server with cache manager and storage client
             proxy_server_ = std::make_unique<ProxyServer>(config.proxy, cache_manager_, storage_client_);
@@ -150,7 +167,9 @@ public:
         }
 
         // Connect transfer manager to proxy server for P2P fallback
-        proxy_server_->set_transfer_manager(std::move(transfer_manager_));
+        // (shared ownership: the application keeps a reference so stop()
+        // below can shut it down deterministically)
+        proxy_server_->set_transfer_manager(transfer_manager_);
 
         if (!proxy_server_->start()) {
             Logger::instance().error("Failed to start proxy server");
@@ -199,9 +218,8 @@ public:
         // Signal received, initiate graceful shutdown
         stop(server_mode);
         Logger::instance().info("stop() returned");
-
-        // Use _exit to bypass normal cleanup which may cause segfault
-        std::_Exit(0);
+        // Return normally: all components have been stopped and destructors
+        // run during stack unwinding in main().
     }
 
 private:
@@ -209,7 +227,7 @@ private:
     std::shared_ptr<ChunkManager> cache_manager_;
     std::shared_ptr<StorageClient> storage_client_;
     std::unique_ptr<NodeDiscovery> node_discovery_;
-    std::unique_ptr<TransferManager> transfer_manager_;
+    std::shared_ptr<TransferManager> transfer_manager_;
     std::unique_ptr<ProxyServer> proxy_server_;
     std::unique_ptr<ControlPlaneClient> control_client_;
     std::unique_ptr<ControlPlaneServer> control_plane_server_;

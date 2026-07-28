@@ -11,6 +11,7 @@
 
 // Include Elio hash for SHA256
 #include <elio/hash/sha256.hpp>
+#include <nlohmann/json.hpp>
 
 namespace eliop2p {
 
@@ -19,10 +20,14 @@ namespace fs = std::filesystem;
 struct ChunkManager::Impl {
     CacheConfig config;
     std::unique_ptr<LRUCache> memory_cache;
-    std::unique_ptr<LRUCache> disk_cache;
     std::unordered_map<std::string, ChunkMetadata> metadata;
     std::string disk_cache_path;
     bool initialized = false;
+
+    // Disk tier: plain chunk files on disk plus an in-memory index
+    // (chunk_id -> file size). Data itself is NOT mirrored in memory -
+    // that is the whole point of having a disk tier.
+    std::unordered_map<std::string, uint64_t> disk_index_;
 
     // Thread safety: shared_mutex for concurrent read access
     mutable std::shared_mutex cache_mutex_;
@@ -33,24 +38,10 @@ struct ChunkManager::Impl {
               cfg.memory_cache_size_mb * 1024 * 1024,
               cfg.eviction_weight_time,
               cfg.eviction_weight_replica,
-              cfg.eviction_weight_heat)),
-          disk_cache(std::make_unique<LRUCache>(
-              cfg.disk_cache_size_mb * 1024 * 1024,
-              cfg.eviction_weight_time,
-              cfg.eviction_weight_replica,
               cfg.eviction_weight_heat)) {
 
         // Set heat thresholds
         memory_cache->set_heat_thresholds(cfg.hot_threshold, cfg.warm_threshold);
-        disk_cache->set_heat_thresholds(cfg.hot_threshold, cfg.warm_threshold);
-
-        // Set eviction callback to persist data to disk when evicted from memory
-        memory_cache->set_eviction_callback([this](const std::string& key, const std::vector<uint8_t>& data) {
-            // When evicted from memory, try to persist to disk if disk cache is enabled
-            if (!disk_cache_path.empty()) {
-                persist_to_disk_internal(key, data);
-            }
-        });
 
         disk_cache_path = cfg.disk_cache_path;
     }
@@ -132,21 +123,25 @@ struct ChunkManager::Impl {
             fs::create_directories(chunks_dir);
             fs::create_directories(metadata_dir);
 
-            // Scan existing chunks and rebuild disk cache
+            // Scan existing chunks and build the index only - data stays on
+            // disk until actually requested (lazy load + promote on hit).
+            disk_index_.clear();
             if (fs::exists(chunks_dir)) {
                 for (const auto& entry : fs::directory_iterator(chunks_dir)) {
                     if (entry.is_regular_file() && entry.path().extension() == ".chunk") {
                         std::string chunk_id = entry.path().stem().string();
-                        auto data = load_from_disk_internal(chunk_id);
-                        if (data) {
-                            disk_cache->put(chunk_id, *data);
+                        std::error_code ec;
+                        auto size = fs::file_size(entry.path(), ec);
+                        if (!ec) {
+                            disk_index_[chunk_id] = size;
                         }
                     }
                 }
             }
 
             initialized = true;
-            Logger::instance().info("Disk cache initialized at: " + disk_cache_path);
+            Logger::instance().info("Disk cache initialized at: " + disk_cache_path +
+                                    " (" + std::to_string(disk_index_.size()) + " chunks indexed)");
             return true;
         } catch (const std::exception& e) {
             Logger::instance().error("Failed to initialize disk cache: " + std::string(e.what()));
@@ -154,23 +149,12 @@ struct ChunkManager::Impl {
         }
     }
 
-    uint64_t calculate_disk_usage() const {
-        if (disk_cache_path.empty()) return 0;
-
-        try {
-            uint64_t total = 0;
-            fs::path chunks_dir = fs::path(disk_cache_path) / "chunks";
-            if (fs::exists(chunks_dir)) {
-                for (const auto& entry : fs::recursive_directory_iterator(chunks_dir)) {
-                    if (entry.is_regular_file()) {
-                        total += entry.file_size();
-                    }
-                }
-            }
-            return total;
-        } catch (const std::exception&) {
-            return 0;
+    uint64_t disk_index_bytes() const {
+        uint64_t total = 0;
+        for (const auto& [id, size] : disk_index_) {
+            total += size;
         }
+        return total;
     }
 };
 
@@ -180,27 +164,40 @@ ChunkManager::ChunkManager(const CacheConfig& config)
 ChunkManager::~ChunkManager() = default;
 
 std::optional<Chunk> ChunkManager::get_chunk(const std::string& chunk_id) {
-    // Use shared lock for reading - allows concurrent readers
-    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+    // Fast path: shared lock, memory hit
+    {
+        std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+        auto chunk = impl_->memory_cache->get(chunk_id);
+        if (chunk) {
+            Logger::instance().debug("Chunk found in memory cache: " + chunk_id);
+            return chunk;
+        }
+    }
 
-    // Try memory cache first
+    // Slow path: check disk index under exclusive lock (promote = write)
+    std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+
+    // Double-check after upgrade: another reader may have promoted it
     auto chunk = impl_->memory_cache->get(chunk_id);
     if (chunk) {
-        Logger::instance().debug("Chunk found in memory cache: " + chunk_id);
         return chunk;
     }
 
-    // Try disk cache
-    chunk = impl_->disk_cache->get(chunk_id);
-    if (chunk) {
-        Logger::instance().debug("Chunk found in disk cache: " + chunk_id);
-        // Promote to memory cache
-        impl_->memory_cache->put(chunk_id, chunk->data());
-        return chunk;
+    if (impl_->disk_index_.find(chunk_id) == impl_->disk_index_.end()) {
+        Logger::instance().debug("Chunk not found in any cache: " + chunk_id);
+        return std::nullopt;
     }
 
-    Logger::instance().debug("Chunk not found in any cache: " + chunk_id);
-    return std::nullopt;
+    auto data = impl_->load_from_disk_internal(chunk_id);
+    if (!data) {
+        // Index said it exists but the file is gone/unreadable; drop the entry
+        impl_->disk_index_.erase(chunk_id);
+        return std::nullopt;
+    }
+
+    Logger::instance().debug("Chunk loaded from disk, promoting to memory: " + chunk_id);
+    impl_->memory_cache->put(chunk_id, *data);
+    return Chunk(chunk_id, *data);
 }
 
 bool ChunkManager::store_chunk(const std::string& chunk_id, const std::vector<uint8_t>& data) {
@@ -232,16 +229,18 @@ bool ChunkManager::store_chunk(const ChunkMetadata& metadata, const std::vector<
         return false;
     }
 
-    // Store in memory cache
+    // Store in memory cache (may fail if item exceeds capacity; the chunk
+    // is still persisted to disk below so it remains retrievable)
     bool success = impl_->memory_cache->put(metadata.chunk_id, data);
 
     // Update metadata
     impl_->metadata[metadata.chunk_id] = metadata;
 
-    // Persist to disk if path is set
+    // Persist to disk if path is set, then register in the disk index
     if (!impl_->disk_cache_path.empty()) {
-        persist_to_disk(metadata.chunk_id, data);
-        impl_->disk_cache->put(metadata.chunk_id, data);
+        if (persist_to_disk(metadata.chunk_id, data)) {
+            impl_->disk_index_[metadata.chunk_id] = data.size();
+        }
     }
 
     Logger::instance().debug("Chunk stored: " + metadata.chunk_id + ", size: " + std::to_string(data.size()));
@@ -253,20 +252,20 @@ bool ChunkManager::remove_chunk(const std::string& chunk_id) {
     std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
 
     bool from_memory = impl_->memory_cache->remove(chunk_id);
-    bool from_disk = impl_->disk_cache->remove(chunk_id);
+    bool from_disk_index = impl_->disk_index_.erase(chunk_id) > 0;
 
     // Remove from disk
     impl_->delete_from_disk(chunk_id);
 
     impl_->metadata.erase(chunk_id);
-    return from_memory || from_disk;
+    return from_memory || from_disk_index;
 }
 
 bool ChunkManager::has_chunk(const std::string& chunk_id) const {
     // Use shared lock for reading
     std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     return impl_->memory_cache->exists(chunk_id) ||
-           impl_->disk_cache->exists(chunk_id);
+           impl_->disk_index_.find(chunk_id) != impl_->disk_index_.end();
 }
 
 std::optional<ChunkMetadata> ChunkManager::get_metadata(const std::string& chunk_id) const {
@@ -279,6 +278,7 @@ std::optional<ChunkMetadata> ChunkManager::get_metadata(const std::string& chunk
 }
 
 void ChunkManager::update_metadata(const ChunkMetadata& metadata) {
+    std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     impl_->metadata[metadata.chunk_id] = metadata;
 
     // Update cache metadata for eviction scoring
@@ -297,12 +297,15 @@ std::string ChunkManager::compute_chunk_id(const std::string& object_key,
 }
 
 CacheStats ChunkManager::get_memory_cache_stats() const {
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     return impl_->memory_cache->stats();
 }
 
 CacheStats ChunkManager::get_disk_cache_stats() const {
-    CacheStats stats = impl_->disk_cache->stats();
-    stats.total_bytes = impl_->calculate_disk_usage();
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+    CacheStats stats;
+    stats.total_items = impl_->disk_index_.size();
+    stats.total_bytes = impl_->disk_index_bytes();
     return stats;
 }
 
@@ -319,6 +322,7 @@ std::optional<std::vector<uint8_t>> ChunkManager::load_from_disk(const std::stri
 }
 
 bool ChunkManager::verify_chunk(const std::string& chunk_id, const std::vector<uint8_t>& data) const {
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     auto it = impl_->metadata.find(chunk_id);
     if (it == impl_->metadata.end()) {
         // No metadata, can't verify
@@ -335,23 +339,31 @@ std::string ChunkManager::compute_sha256(const std::vector<uint8_t>& data) {
 }
 
 uint64_t ChunkManager::total_memory_usage() const {
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     return impl_->memory_cache->current_size();
 }
 
 uint64_t ChunkManager::total_disk_usage() const {
-    return impl_->calculate_disk_usage();
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+    return impl_->disk_index_bytes();
 }
 
 bool ChunkManager::should_promote_to_disk() const {
-    return impl_->disk_cache->usage() < 0.8f;
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+    // Disk tier has no capacity bookkeeping of its own; promote (write to
+    // disk) whenever a path is configured.
+    return !impl_->disk_cache_path.empty();
 }
 
 bool ChunkManager::should_demote_from_memory() const {
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     return impl_->memory_cache->usage() > 0.8f;
 }
 
 bool ChunkManager::promote_to_memory(const std::string& chunk_id) {
-    // Check if exists in disk cache
+    std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+
+    // Load from disk
     auto data = impl_->load_from_disk_internal(chunk_id);
     if (!data) {
         return false;
@@ -362,6 +374,8 @@ bool ChunkManager::promote_to_memory(const std::string& chunk_id) {
 }
 
 bool ChunkManager::demote_to_disk(const std::string& chunk_id) {
+    std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
+
     // Get from memory cache
     auto chunk = impl_->memory_cache->get(chunk_id);
     if (!chunk) {
@@ -371,17 +385,18 @@ bool ChunkManager::demote_to_disk(const std::string& chunk_id) {
     // Persist to disk
     bool success = persist_to_disk(chunk_id, chunk->data());
 
-    // Remove from memory cache
+    // Remove from memory cache and register in the disk index
     if (success) {
         impl_->memory_cache->remove(chunk_id);
+        impl_->disk_index_[chunk_id] = chunk->size();
     }
 
     return success;
 }
 
 void ChunkManager::trigger_eviction() {
+    std::unique_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     impl_->memory_cache->maybe_evict();
-    impl_->disk_cache->maybe_evict();
 }
 
 bool ChunkManager::initialize_disk_cache() {
@@ -389,14 +404,43 @@ bool ChunkManager::initialize_disk_cache() {
 }
 
 bool ChunkManager::sync_metadata() const {
+    std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
     if (impl_->disk_cache_path.empty()) return false;
 
     try {
-        fs::path metadata_path = fs::path(impl_->disk_cache_path) / "metadata" / "cache_metadata.json";
+        fs::path metadata_dir = fs::path(impl_->disk_cache_path) / "metadata";
+        fs::create_directories(metadata_dir);
+        fs::path metadata_path = metadata_dir / "cache_metadata.json";
 
-        // For now, we skip metadata persistence as it would require JSON serialization
-        // In production, implement proper metadata persistence
-        Logger::instance().debug("Metadata sync not fully implemented");
+        nlohmann::json j = nlohmann::json::array();
+        for (const auto& [id, m] : impl_->metadata) {
+            j.push_back({
+                {"chunk_id", m.chunk_id},
+                {"object_key", m.object_key},
+                {"offset", m.offset},
+                {"size", m.size},
+                {"hash", m.hash},
+                {"version", m.version},
+                {"is_immutable", m.is_immutable},
+                {"replica_count", m.replica_count},
+                {"heat_level", static_cast<int>(m.heat_level)},
+                {"last_access_time", m.last_access_time},
+                {"creation_time", m.creation_time},
+            });
+        }
+
+        // Atomic write: temp file + rename
+        fs::path tmp_path = metadata_path;
+        tmp_path += ".tmp";
+        {
+            std::ofstream file(tmp_path);
+            if (!file) {
+                Logger::instance().error("Failed to open metadata file for writing: " + tmp_path.string());
+                return false;
+            }
+            file << j.dump(2);
+        }
+        fs::rename(tmp_path, metadata_path);
         return true;
     } catch (const std::exception& e) {
         Logger::instance().error("Failed to sync metadata: " + std::string(e.what()));

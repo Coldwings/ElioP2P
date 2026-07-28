@@ -33,9 +33,6 @@ struct ProxyServer::Impl {
 
     // Server instance for elio::serve
     std::unique_ptr<elio::http::server> http_server;
-
-    // Pipe for stop notification
-    int stop_pipe[2] = {-1, -1};
 };
 
 ProxyServer::ProxyServer(const ProxyConfig& config,
@@ -46,11 +43,6 @@ ProxyServer::ProxyServer(const ProxyConfig& config,
     impl_->cache_manager = cache_manager;
     impl_->storage_client = storage_client;
     impl_->request_handler = std::make_shared<RequestHandler>(cache_manager, storage_client);
-
-    // Create pipe for stop notification
-    if (pipe(impl_->stop_pipe) == -1) {
-        Logger::instance().error("Failed to create stop pipe");
-    }
 }
 
 ProxyServer::~ProxyServer() {
@@ -124,24 +116,26 @@ bool ProxyServer::start() {
         co_return co_await proxy_request_handler(ctx, impl_->request_handler);
     });
 
-    // Register catch-all route for any path (bucket/key format)
-    r.get("/:path", [this](elio::http::context& ctx)
+    // Register catch-all route for any path (bucket/key format). The wildcard
+    // segment "*" must be the final segment and consumes all remaining path
+    // components, so multi-segment S3 keys like /bucket/a/b/c are matched.
+    r.get("/*", [this](elio::http::context& ctx)
           -> elio::coro::task<elio::http::response> {
         co_return co_await proxy_request_handler(ctx, impl_->request_handler);
     });
 
     // Also handle POST, PUT, DELETE for full API support
-    r.post("/:path", [this](elio::http::context& ctx)
+    r.post("/*", [this](elio::http::context& ctx)
            -> elio::coro::task<elio::http::response> {
         co_return co_await proxy_request_handler(ctx, impl_->request_handler);
     });
 
-    r.put("/:path", [this](elio::http::context& ctx)
+    r.put("/*", [this](elio::http::context& ctx)
            -> elio::coro::task<elio::http::response> {
         co_return co_await proxy_request_handler(ctx, impl_->request_handler);
     });
 
-    r.del("/:path", [this](elio::http::context& ctx)
+    r.del("/*", [this](elio::http::context& ctx)
            -> elio::coro::task<elio::http::response> {
         co_return co_await proxy_request_handler(ctx, impl_->request_handler);
     });
@@ -160,14 +154,18 @@ bool ProxyServer::start() {
 
     // Determine bind address
     elio::net::socket_address bind_addr;
+    elio::net::tcp_options opts;
     if (impl_->config.bind_address == "0.0.0.0") {
+        // IPv4 any-address
+        bind_addr = elio::net::socket_address(elio::net::ipv4_address(impl_->config.listen_port));
+    } else if (impl_->config.bind_address == "::" || impl_->config.bind_address.empty()) {
+        // IPv6 any-address with dual-stack (also accepts IPv4-mapped)
         bind_addr = elio::net::socket_address(elio::net::ipv6_address(impl_->config.listen_port));
+        opts.ipv6_only = false;
     } else {
         bind_addr = elio::net::socket_address(impl_->config.bind_address, impl_->config.listen_port);
+        opts.ipv6_only = (impl_->config.bind_address.find(':') != std::string::npos);
     }
-
-    elio::net::tcp_options opts;
-    opts.ipv6_only = (impl_->config.bind_address != "0.0.0.0");
 
     // Start HTTP server in a separate thread using elio scheduler
     impl_->server_thread = std::thread([this, bind_addr, opts]() {
@@ -209,20 +207,10 @@ void ProxyServer::stop() {
         Logger::instance().info("Stopping proxy server - setting running to false");
         impl_->running = false;
 
-        // Wait for server thread to finish briefly
+        // The server coroutine polls `running` every 100ms and returns after
+        // stopping the HTTP server, so elio::run() exits and the thread ends.
         if (impl_->server_thread.joinable()) {
-            constexpr auto timeout = std::chrono::seconds(1);
-            auto start = std::chrono::steady_clock::now();
-
-            while (impl_->server_thread.joinable()) {
-                auto elapsed = std::chrono::steady_clock::now() - start;
-                if (elapsed >= timeout) {
-                    Logger::instance().warning("Server thread join timeout, detaching");
-                    impl_->server_thread.detach();
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
+            impl_->server_thread.join();
         }
 
         Logger::instance().info("Proxy server stopped");
@@ -264,10 +252,6 @@ void ProxyServer::set_p2p_fallback_enabled(bool enabled) {
         impl_->request_handler->set_p2p_fallback_enabled(enabled);
     }
     Logger::instance().info("P2P fallback " + std::string(enabled ? "enabled" : "disabled"));
-}
-
-int ProxyServer::get_stop_event_fd() const {
-    return impl_->stop_pipe[0];
 }
 
 } // namespace eliop2p

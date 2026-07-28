@@ -106,6 +106,11 @@ struct LRUCache::Impl {
     }
 
     // Multi-factor weighted eviction: selects item with highest eviction score
+    // among a sample of the coldest entries (Redis-style approximated LRU:
+    // sampling a bounded window instead of scanning the whole table keeps
+    // eviction O(1)-ish while still picking a near-optimal victim).
+    static constexpr size_t EVICTION_SAMPLE_SIZE = 32;
+
     std::string select_eviction_target() {
         if (lru_list_.empty()) return "";
 
@@ -113,8 +118,11 @@ struct LRUCache::Impl {
         std::string target;
         float max_score = -1.0f;
 
-        // Find item with highest eviction score
-        for (const auto& key : lru_list_) {
+        // Sample from the tail (least recently used) backwards
+        size_t sampled = 0;
+        for (auto it = lru_list_.rbegin(); it != lru_list_.rend() && sampled < EVICTION_SAMPLE_SIZE;
+             ++it, ++sampled) {
+            const auto& key = *it;
             auto chunk_it = cache_.find(key);
             if (chunk_it == cache_.end()) continue;
 
@@ -135,7 +143,7 @@ struct LRUCache::Impl {
             }
         }
 
-        // If all items are protected, select the oldest one anyway
+        // If all sampled items are protected, select the oldest one anyway
         if (target.empty()) {
             target = lru_list_.back();
         }
@@ -173,10 +181,9 @@ struct LRUCache::Impl {
         stats_.cold_items = 0;
 
         for (const auto& pair : cache_) {
-            // Create a non-const copy to compute heat level since it's mutable
-            Chunk& chunk = const_cast<Chunk&>(pair.second);
-            chunk.compute_heat_level(now, hot_threshold_, warm_threshold_);
-            switch (chunk.heat_level()) {
+            // compute_heat_level is const and only touches mutable members
+            pair.second.compute_heat_level(now, hot_threshold_, warm_threshold_);
+            switch (pair.second.heat_level()) {
                 case HeatLevel::Hot: stats_.hot_items++; break;
                 case HeatLevel::Warm: stats_.warm_items++; break;
                 case HeatLevel::Cold: stats_.cold_items++; break;
@@ -227,6 +234,15 @@ std::optional<Chunk> LRUCache::get(const std::string& key) {
 
 bool LRUCache::put(const std::string& key, const std::vector<uint8_t>& data) {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+
+    // Refuse items larger than the whole capacity: inserting them would
+    // evict everything else and still overflow, leaving current_size_
+    // permanently above max_capacity_.
+    if (data.size() > impl_->max_capacity_) {
+        Logger::instance().warning("Refusing to cache item larger than cache capacity: " + key +
+                                   " (" + std::to_string(data.size()) + " bytes)");
+        return false;
+    }
 
     // Check if key already exists
     auto it = impl_->cache_.find(key);
