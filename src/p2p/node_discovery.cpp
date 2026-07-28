@@ -159,7 +159,7 @@ struct NodeDiscovery::Impl {
 
             // Spawn handler coroutine
             auto handler = handle_tcp_connection(std::move(*stream_result));
-            scheduler->spawn(handler.release());
+            scheduler->spawn(elio::coro::detail::task_access::release(std::move(handler)));
         }
 
         Logger::instance().info("TCP gossip server accept loop stopped");
@@ -219,7 +219,7 @@ struct NodeDiscovery::Impl {
 
             // Start accept loop coroutine
             auto accept_loop = tcp_server_accept_loop();
-            scheduler->spawn(accept_loop.release());
+            scheduler->spawn(elio::coro::detail::task_access::release(std::move(accept_loop)));
 
             // Keep thread alive while running
             while (tcp_server_running.load()) {
@@ -592,7 +592,8 @@ struct NodeDiscovery::Impl {
             elio::net::tcp_options opts;
             opts.no_delay = true;
 
-            auto connect_result = co_await elio::net::tcp_connect(peer.address, peer.port, opts);
+            auto connect_result = co_await elio::net::tcp_connect(
+                elio::net::socket_address(peer.address, peer.port), opts);
 
             if (!connect_result) {
                 Logger::instance().warning("Failed to connect to peer " + peer.node_id +
@@ -886,7 +887,7 @@ void NodeDiscovery::broadcast_node_join() {
             // Send via TCP - spawn coroutine if we have a scheduler
             if (impl_->scheduler) {
                 auto send_task = impl_->send_gossip_message_to_peer(peers[i], join_msg);
-                impl_->scheduler->spawn(send_task.release());
+                impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(send_task)));
             }
         }
     }
@@ -917,7 +918,7 @@ void NodeDiscovery::broadcast_node_leave() {
             // Send via TCP
             if (impl_->scheduler) {
                 auto send_task = impl_->send_gossip_message_to_peer(peers[i], leave_msg);
-                impl_->scheduler->spawn(send_task.release());
+                impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(send_task)));
             }
         }
     }
@@ -949,7 +950,7 @@ void NodeDiscovery::broadcast_chunk_announce(const std::string& chunk_id) {
         // Send via TCP
         if (impl_->scheduler) {
             auto send_task = impl_->send_gossip_message_to_peer(peers[i], msg);
-            impl_->scheduler->spawn(send_task.release());
+            impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(send_task)));
         }
     }
 }
@@ -977,7 +978,7 @@ void NodeDiscovery::broadcast_chunk_remove(const std::string& chunk_id) {
         // Send via TCP
         if (impl_->scheduler) {
             auto send_task = impl_->send_gossip_message_to_peer(peers[i], msg);
-            impl_->scheduler->spawn(send_task.release());
+            impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(send_task)));
         }
     }
 }

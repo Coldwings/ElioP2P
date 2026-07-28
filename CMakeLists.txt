@@ -74,9 +74,16 @@ set(ELIO_ENABLE_TLS ON CACHE BOOL "" FORCE)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(elio)
 
-# After FetchContent_MakeAvailable, the Elio target should be available
-# Create alias if needed for compatibility
-if(TARGET elio AND NOT TARGET Elio::Elio)
+# After FetchContent_MakeAvailable, the Elio targets should be available
+# Newer Elio splits functionality into layered INTERFACE targets:
+#   elio (core) <- elio_tls (ELIO_HAS_TLS) <- elio_http (ELIO_HAS_HTTP)
+# Link the highest available layer so TLS/HTTP features and their
+# compile definitions propagate to all ElioP2P targets.
+if(TARGET elio_http AND NOT TARGET Elio::Elio)
+    add_library(Elio::Elio ALIAS elio_http)
+elseif(TARGET elio_tls AND NOT TARGET Elio::Elio)
+    add_library(Elio::Elio ALIAS elio_tls)
+elseif(TARGET elio AND NOT TARGET Elio::Elio)
     add_library(Elio::Elio ALIAS elio)
 endif()
 

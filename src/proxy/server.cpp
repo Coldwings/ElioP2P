@@ -174,8 +174,10 @@ bool ProxyServer::start() {
         Logger::instance().info("Proxy HTTP server thread started");
 
         elio::run([this, bind_addr, opts]() -> elio::coro::task<void> {
-            auto listen_task = impl_->http_server->listen(bind_addr, opts);
-            auto listen_handle = std::move(listen_task).spawn();
+            auto listen_handle = elio::runtime::get_current_scheduler()->go_joinable(
+                [this, bind_addr, opts]() -> elio::coro::task<void> {
+                    co_await impl_->http_server->listen(bind_addr, opts);
+                });
 
             // Wait for running flag to become false
             while (impl_->running) {
@@ -190,7 +192,7 @@ bool ProxyServer::start() {
 
             Logger::instance().info("HTTP server stopped");
             co_return;
-        }());
+        });
 
         Logger::instance().info("Proxy HTTP server thread exiting");
     });

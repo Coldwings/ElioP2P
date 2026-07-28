@@ -241,7 +241,8 @@ struct TransferManager::Impl {
                 }
 
                 // Handle request in background
-                (void)handle_chunk_request(std::move(*stream_result)).spawn();
+                auto handler = handle_chunk_request(std::move(*stream_result));
+                scheduler->spawn(elio::coro::detail::task_access::release(std::move(handler)));
 
             } catch (const std::exception& e) {
                 if (tcp_server_running) {
@@ -312,7 +313,8 @@ elio::coro::task<void> TransferManager::start_tcp_server() {
     Logger::instance().info("TCP chunk server listening on port " + std::to_string(impl_->listen_port));
 
     // Run server loop in the scheduler
-    (void)impl_->tcp_server_loop().spawn();
+    auto server_loop = impl_->tcp_server_loop();
+    impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(server_loop)));
 
     co_return;
 }
@@ -433,7 +435,8 @@ elio::coro::task<std::pair<bool, uint64_t>> download_from_peer(
         elio::net::tcp_options opts;
         opts.no_delay = true;
 
-        auto connect_result = co_await elio::net::tcp_connect(peer.address, peer.port, opts);
+        auto connect_result = co_await elio::net::tcp_connect(
+            elio::net::socket_address(peer.address, peer.port), opts);
         if (!connect_result) {
             Logger::instance().error("Failed to connect to peer: " + peer.node_id);
             co_return std::make_pair(false, 0);
@@ -585,7 +588,8 @@ elio::coro::task<std::pair<bool, uint64_t>> download_from_peer_to_file(
         elio::net::tcp_options opts;
         opts.no_delay = true;
 
-        auto connect_result = co_await elio::net::tcp_connect(peer.address, peer.port, opts);
+        auto connect_result = co_await elio::net::tcp_connect(
+            elio::net::socket_address(peer.address, peer.port), opts);
         if (!connect_result) {
             Logger::instance().error("Failed to connect to peer for file download: " + peer.node_id);
             co_return std::make_pair(false, 0);
@@ -796,15 +800,15 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_
     // Launch all peer downloads in parallel using spawn()
     for (size_t i = 0; i < selected_peers.size(); ++i) {
         const auto& peer = selected_peers[i];
-        auto download_task = download_from_peer(
+        auto download_task = impl_->scheduler->go_joinable(
+            download_from_peer,
             impl_->download_limiter.get(),
             ctx,
             peer,
-            result,
-            progress,
+            std::ref(result),
+            std::ref(progress),
             progress_callback,
-            transfer_running
-        ).spawn();
+            std::ref(transfer_running));
         download_tasks.push_back(std::move(download_task));
     }
 
@@ -979,15 +983,15 @@ elio::coro::task<bool> TransferManager::download_chunk_to_file(
 
     for (size_t i = 0; i < selected_peers.size(); ++i) {
         const auto& peer = selected_peers[i];
-        auto download_task = download_from_peer_to_file(
+        auto download_task = impl_->scheduler->go_joinable(
+            download_from_peer_to_file,
             impl_->download_limiter.get(),
             ctx,
             peer,
-            out_file,
-            progress,
+            std::ref(out_file),
+            std::ref(progress),
             progress_callback,
-            transfer_running
-        ).spawn();
+            std::ref(transfer_running));
         download_tasks.push_back(std::move(download_task));
     }
 
@@ -1103,7 +1107,8 @@ elio::coro::task<bool> TransferManager::upload_chunk(
         elio::net::tcp_options opts;
         opts.no_delay = true;
 
-        auto connect_result = co_await elio::net::tcp_connect(target_peer.address, target_peer.port, opts);
+        auto connect_result = co_await elio::net::tcp_connect(
+            elio::net::socket_address(target_peer.address, target_peer.port), opts);
         if (!connect_result) {
             Logger::instance().error("Failed to connect to peer for upload: " + target_peer.node_id);
             impl_->stats.failed_uploads++;
