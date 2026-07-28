@@ -28,16 +28,23 @@ static std::string sha256_hex(const std::string& data) {
     return oss.str();
 }
 
-// HMAC-SHA256 helper
-static std::string hmac_sha256(const std::string& key, const std::string& data) {
+// HMAC-SHA256 returning the raw 32-byte digest. The SigV4 key-derivation
+// chain must feed BINARY digests forward - hex-encoding intermediate keys
+// silently derives completely different signing keys.
+static std::string hmac_sha256_raw(const std::string& key, const std::string& data) {
     unsigned char hash[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
     HMAC(EVP_sha256(), key.data(), key.size(),
          reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash, &len);
+    return std::string(reinterpret_cast<char*>(hash), len);
+}
 
+// HMAC-SHA256 returning lowercase hex (for the final signature value only)
+static std::string hmac_sha256(const std::string& key, const std::string& data) {
+    std::string raw = hmac_sha256_raw(key, data);
     std::ostringstream oss;
-    for (unsigned int i = 0; i < len; ++i) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    for (unsigned char c : raw) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c);
     }
     return oss.str();
 }
@@ -193,6 +200,14 @@ S3Client::S3Client(const StorageConfig& config)
         access_key_ = *config.access_key;
         secret_key_ = *config.secret_key;
     }
+    // An explicit scheme in the endpoint overrides use_https: without this,
+    // "http://minio:9000" with the default use_https=true would attempt a
+    // TLS handshake against a plaintext listener.
+    if (config_.endpoint.rfind("http://", 0) == 0) {
+        config_.use_https = false;
+    } else if (config_.endpoint.rfind("https://", 0) == 0) {
+        config_.use_https = true;
+    }
     Logger::instance().info("S3Client initialized with endpoint: " + config.endpoint);
 }
 
@@ -310,6 +325,7 @@ std::vector<std::pair<std::string, std::string>> S3Client::sign_request(
     canonical_request << payload_hash;
 
     std::string canonical_request_hash = sha256_hex(canonical_request.str());
+    Logger::instance().debug("SigV4 canonical request:\n" + canonical_request.str());
 
     // Build string to sign
     std::ostringstream string_to_sign;
@@ -318,12 +334,13 @@ std::vector<std::pair<std::string, std::string>> S3Client::sign_request(
     string_to_sign << date_stamp << "/" << region << "/" << service << "/aws4_request\n";
     string_to_sign << canonical_request_hash;
 
-    // Calculate signature
+    // Calculate signature. The derivation chain feeds raw binary digests;
+    // only the final signature is hex-encoded.
     std::string k_secret = "AWS4" + impl_->secret_key;
-    std::string k_date = hmac_sha256(k_secret, date_stamp);
-    std::string k_region = hmac_sha256(k_date, region);
-    std::string k_service = hmac_sha256(k_region, service);
-    std::string k_signing = hmac_sha256(k_service, "aws4_request");
+    std::string k_date = hmac_sha256_raw(k_secret, date_stamp);
+    std::string k_region = hmac_sha256_raw(k_date, region);
+    std::string k_service = hmac_sha256_raw(k_region, service);
+    std::string k_signing = hmac_sha256_raw(k_service, "aws4_request");
     std::string signature = hmac_sha256(k_signing, string_to_sign.str());
 
     // Build authorization header
@@ -418,10 +435,10 @@ std::string S3Client::generate_presigned_url_internal(
 
     // Calculate signature
     std::string k_secret = "AWS4" + impl_->secret_key;
-    std::string k_date = hmac_sha256(k_secret, date_stamp);
-    std::string k_region = hmac_sha256(k_date, region);
-    std::string k_service = hmac_sha256(k_region, "s3");
-    std::string k_signing = hmac_sha256(k_service, "aws4_request");
+    std::string k_date = hmac_sha256_raw(k_secret, date_stamp);
+    std::string k_region = hmac_sha256_raw(k_date, region);
+    std::string k_service = hmac_sha256_raw(k_region, "s3");
+    std::string k_signing = hmac_sha256_raw(k_service, "aws4_request");
     std::string signature = hmac_sha256(k_signing, string_to_sign.str());
 
     // Build final URL
@@ -526,7 +543,11 @@ elio::coro::task<std::optional<std::vector<std::string>>> S3Client::list_buckets
     elio::http::request req(elio::http::method::GET, "/");
 
     auto [host, port] = parse_endpoint(config_.endpoint, config_.use_https);
-    req.set_host(host);
+    {
+        const bool default_port =
+            (config_.use_https && port == 443) || (!config_.use_https && port == 80);
+        req.set_host(default_port ? host : host + ":" + std::to_string(port));
+    }
 
     for (const auto& h : signed_headers) {
         req.set_header(h.first, h.second);
@@ -643,6 +664,12 @@ elio::coro::task<std::optional<ObjectMetadata>> S3Client::head_object(
             Logger::instance().debug("Object not found: " + bucket + "/" + key);
         } else {
             Logger::instance().error("Head object failed with status: " + std::to_string(status));
+            // MinIO/S3 include the expected StringToSign in the error body -
+            // log it to make signature mismatches debuggable
+            auto body = response->body();
+            if (!body.empty()) {
+                Logger::instance().error("Head object error body: " + std::string(body.substr(0, 2048)));
+            }
         }
         co_return std::nullopt;
     }
@@ -719,6 +746,10 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> S3Client::get_object(
     auto status = response->status_code();
     if (status != 200 && status != 206) {
         Logger::instance().error("Get object failed with status: " + std::to_string(status));
+        auto err_body = response->body();
+        if (!err_body.empty()) {
+            Logger::instance().error("Get object error body: " + std::string(err_body.substr(0, 3000)));
+        }
         co_return std::nullopt;
     }
 
@@ -931,9 +962,15 @@ elio::coro::task<std::optional<elio::http::response>> S3Client::execute_request(
         req.set_query(canonical_query);
     }
 
-    // Set host header
+    // Set host header. The Host header on the wire MUST match the host used
+    // in the signature's canonical headers, including a non-default port -
+    // otherwise the server recomputes a different signature (403).
     auto [host, port] = parse_endpoint(config_.endpoint, config_.use_https);
-    req.set_host(host);
+    {
+        const bool default_port =
+            (config_.use_https && port == 443) || (!config_.use_https && port == 80);
+        req.set_host(default_port ? host : host + ":" + std::to_string(port));
+    }
 
     // Add signed headers
     for (const auto& h : signed_headers) {
