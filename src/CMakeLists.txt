@@ -25,6 +25,7 @@ target_include_directories(cache_obj PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${ELIO_INCLUDE_DIR}
     ${FMT_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/_deps/nlohmann_json-src/include
 )
 if(TARGET Elio::Elio)
     target_link_libraries(cache_obj PUBLIC Elio::Elio)
