@@ -2,6 +2,7 @@
 #include "eliop2p/base/logger.h"
 #include "eliop2p/p2p/transfer.h"
 #include <elio/elio.hpp>
+#include <atomic>
 #include <sstream>
 #include <chrono>
 #include <ctime>
@@ -53,11 +54,12 @@ std::string HttpResponse::get_header(const std::string& name) const {
 struct RequestHandler::Impl {
     std::shared_ptr<ChunkManager> cache_manager;
     std::shared_ptr<StorageClient> storage_client;
-    std::shared_ptr<TransferManager> transfer_manager;
+    // Atomics: setters may race with concurrent handle_request coroutines
+    std::atomic<std::shared_ptr<TransferManager>> transfer_manager;
 
     // Configuration
     uint64_t chunk_size_mb = 16;
-    bool enable_p2p_fallback = true;
+    std::atomic<bool> enable_p2p_fallback{true};
 
     Impl(std::shared_ptr<ChunkManager> cm, std::shared_ptr<StorageClient> sc)
         : cache_manager(cm), storage_client(sc) {}
@@ -70,11 +72,11 @@ RequestHandler::RequestHandler(std::shared_ptr<ChunkManager> cache_manager,
 RequestHandler::~RequestHandler() = default;
 
 void RequestHandler::set_transfer_manager(std::shared_ptr<TransferManager> transfer_manager) {
-    impl_->transfer_manager = transfer_manager;
+    impl_->transfer_manager.store(std::move(transfer_manager));
 }
 
 void RequestHandler::set_p2p_fallback_enabled(bool enabled) {
-    impl_->enable_p2p_fallback = enabled;
+    impl_->enable_p2p_fallback.store(enabled);
 }
 
 RequestAuthType RequestHandler::detect_auth_type(const HttpRequest& request) const {
@@ -110,36 +112,6 @@ RequestAuthType RequestHandler::detect_auth_type(const HttpRequest& request) con
 
     // No authentication
     return RequestAuthType::None;
-}
-
-bool RequestHandler::is_header_signature_reusable(const HttpRequest& request) const {
-    std::string date_str = request.get_header("x-amz-date");
-    if (date_str.empty()) {
-        return false;
-    }
-
-    // Try to parse the date (format: YYYYMMDDTHHMMSSZ or YYYYMMDDTHHMMSS.fffZ)
-    // For simplicity, we'll check if it's within a reasonable time window
-    // In production, you'd parse and compare timestamps properly
-    try {
-        // Extract date portion (first 8 chars: YYYYMMDD)
-        if (date_str.length() >= 8) {
-            std::string date_part = date_str.substr(0, 8);
-            // Get current date
-            auto now = std::chrono::system_clock::now();
-            auto time_t = std::chrono::system_clock::to_time_t(now);
-            std::ostringstream oss;
-            oss << std::put_time(std::gmtime(&time_t), "%Y%m%d");
-            std::string current_date = oss.str();
-
-            // Check if within 7 days (simplified: just same day or day before)
-            return date_part >= current_date;
-        }
-    } catch (...) {
-        // If parsing fails, assume not reusable
-    }
-
-    return false;
 }
 
 std::optional<RequestHandler::CacheKeyInfo> RequestHandler::parse_cache_key(
@@ -194,32 +166,22 @@ std::optional<RequestHandler::CacheKeyInfo> RequestHandler::parse_cache_key(
 }
 
 bool RequestHandler::is_cacheable(const HttpRequest& request) const {
-    // Only GET requests are cacheable
-    if (request.method != "GET") {
-        return false;
-    }
-
-    // Check auth type - certain auth types are not cacheable
-    RequestAuthType auth_type = detect_auth_type(request);
-    if (auth_type == RequestAuthType::NonReusableHeader) {
-        // Non-reusable header signatures cannot be cached
-        return false;
-    }
-
-    return true;
+    // Only GET requests are cacheable. Authentication does not affect
+    // cacheability: the backend signs with its own configured credentials,
+    // and the cache key is auth-independent (see get_cache_key).
+    return request.method == "GET";
 }
 
 std::string RequestHandler::get_cache_key(const CacheKeyInfo& info) const {
     std::ostringstream oss;
     oss << info.full_object_key;
 
-    // Include version/etag if available for cache key
+    // Include etag (If-None-Match) for variant distinction. Presigned URL
+    // query strings are deliberately NOT included: every signed URL differs,
+    // which would make the cache permanently useless for signed traffic and
+    // store duplicates of the same object.
     if (info.etag) {
         oss << "?v=" << *info.etag;
-    } else if (!info.query_string.empty()) {
-        // If there's a query string (presigned URL), include it
-        // This ensures different signed URLs don't share cache
-        oss << "?q=" << info.query_string;
     }
 
     return oss.str();
@@ -274,68 +236,16 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
 
     Logger::instance().info("Cache MISS for: " + cache_key);
 
-    // Cache miss - fetch from storage
-    if (!impl_->storage_client) {
-        // Try P2P fallback if enabled
-        if (impl_->enable_p2p_fallback && impl_->transfer_manager) {
-            Logger::instance().info("Storage unavailable, trying P2P fallback for: " + cache_key);
-            auto p2p_data = co_await try_p2p_fallback(cache_key, *cache_key_info);
-            if (p2p_data) {
-                // Store in cache
-                if (impl_->cache_manager && can_cache) {
-                    impl_->cache_manager->store_chunk(cache_key, *p2p_data);
-                }
-                response.status_code = 200;
-                response.status_message = "OK";
-                response.set_header("Content-Type", "application/octet-stream");
-                response.set_header("X-Cache", "P2P");
-                response.body = *p2p_data;
-                co_return response;
-            }
-        }
+    // Snapshot shared state once (setters may run concurrently)
+    auto transfer_manager = impl_->transfer_manager.load();
+    const bool p2p_enabled = impl_->enable_p2p_fallback.load();
 
-        response.status_code = 503;
-        response.status_message = "Service Unavailable";
-        response.set_header("Content-Type", "text/plain");
-        std::string msg = "Storage backend not available";
-        response.body.assign(msg.begin(), msg.end());
-        co_return response;
-    }
-
-    // Prepare authentication headers for storage request
-    std::vector<std::pair<std::string, std::string>> auth_headers;
-    std::string auth_query_string;
-
-    // Pass through authentication info if present
-    if (cache_key_info->auth_header) {
-        // Add Authorization header
-        auto auth_header_val = *cache_key_info->auth_header;
-        // Find and pass all relevant auth headers
-        for (const auto& [key, value] : request.headers) {
-            if (key == "Authorization" || key == "x-amz-date" ||
-                key == "x-amz-content-sha256" || key == "x-amz-security-token") {
-                auth_headers.push_back({key, value});
-            }
-        }
-    }
-
-    // Pass presigned URL query string if present
-    if (!cache_key_info->query_string.empty()) {
-        auth_query_string = cache_key_info->query_string;
-    }
-
-    // Fetch from storage with auth info
-    auto storage_data = co_await impl_->storage_client->get_object(
-        cache_key_info->bucket,
-        cache_key_info->object_key
-    );
-
-    // If storage fails and P2P fallback is enabled, try P2P
-    if (!storage_data && impl_->enable_p2p_fallback && impl_->transfer_manager) {
-        Logger::instance().info("Storage fetch failed, trying P2P fallback for: " + cache_key);
+    // P2P network first: a peer holding the object serves it over the LAN,
+    // which is the whole point of the cache network - avoid storage round
+    // trips whenever any peer has the data.
+    if (p2p_enabled && transfer_manager) {
         auto p2p_data = co_await try_p2p_fallback(cache_key, *cache_key_info);
         if (p2p_data) {
-            // Store in cache
             if (impl_->cache_manager && can_cache) {
                 impl_->cache_manager->store_chunk(cache_key, *p2p_data);
             }
@@ -346,7 +256,24 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
             response.body = *p2p_data;
             co_return response;
         }
+        Logger::instance().info("P2P lookup failed, falling back to storage: " + cache_key);
     }
+
+    // Storage origin. The storage client signs requests with its own
+    // configured credentials, so no client auth headers are forwarded.
+    if (!impl_->storage_client) {
+        response.status_code = 503;
+        response.status_message = "Service Unavailable";
+        response.set_header("Content-Type", "text/plain");
+        std::string msg = "Storage backend not available";
+        response.body.assign(msg.begin(), msg.end());
+        co_return response;
+    }
+
+    auto storage_data = co_await impl_->storage_client->get_object(
+        cache_key_info->bucket,
+        cache_key_info->object_key
+    );
 
     if (!storage_data) {
         response.status_code = 404;
@@ -377,7 +304,8 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
 elio::coro::task<std::optional<std::vector<uint8_t>>>
 RequestHandler::try_p2p_fallback(const std::string& cache_key,
                                   const CacheKeyInfo& cache_key_info) {
-    if (!impl_->transfer_manager) {
+    auto transfer_manager = impl_->transfer_manager.load();
+    if (!transfer_manager) {
         co_return std::nullopt;
     }
 
@@ -389,7 +317,7 @@ RequestHandler::try_p2p_fallback(const std::string& cache_key,
     transfer_req.k_value = 3;  // Try 3 peers in parallel for fallback
     transfer_req.mode = TransferMode::FastestFirst;
 
-    auto result = co_await impl_->transfer_manager->download_chunk(transfer_req);
+    auto result = co_await transfer_manager->download_chunk(transfer_req);
 
     if (result) {
         Logger::instance().info("P2P fallback successful for: " + cache_key);

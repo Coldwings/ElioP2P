@@ -86,9 +86,6 @@ public:
     // Detect authentication type from request
     RequestAuthType detect_auth_type(const HttpRequest& request) const;
 
-    // Check if header signature is reusable (has x-amz-date within valid window)
-    bool is_header_signature_reusable(const HttpRequest& request) const;
-
     // Try P2P fallback when storage is unavailable
     elio::coro::task<std::optional<std::vector<uint8_t>>>
     try_p2p_fallback(const std::string& cache_key, const CacheKeyInfo& cache_key_info);
