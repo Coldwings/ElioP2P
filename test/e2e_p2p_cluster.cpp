@@ -168,6 +168,9 @@ struct TestNode {
     std::unique_ptr<NodeDiscovery> discovery;
     std::shared_ptr<TransferManager> transfer;
     std::unique_ptr<ProxyServer> proxy;
+    // Optional override for the chunk provider (used by the malicious node
+    // to serve poisoned bytes)
+    TransferManager::ChunkDataProvider provider_override;
 
     bool start(const std::string& node_id, const std::string& disk_path) {
         cache = std::make_shared<ChunkManager>(cache_cfg);
@@ -183,12 +186,16 @@ struct TestNode {
         transfer->set_scheduler(scheduler);
         transfer->set_node_discovery(discovery.get());
         transfer->set_chunk_manager(cache.get());
-        transfer->set_chunk_data_provider(
-            [cm = cache](const std::string& chunk_id) -> std::shared_ptr<const std::vector<uint8_t>> {
-                auto chunk = cm->get_chunk(chunk_id);
-                if (!chunk) return nullptr;
-                return std::shared_ptr<const std::vector<uint8_t>>(chunk, &chunk->data());
-            });
+        if (provider_override) {
+            transfer->set_chunk_data_provider(provider_override);
+        } else {
+            transfer->set_chunk_data_provider(
+                [cm = cache](const std::string& chunk_id) -> std::shared_ptr<const std::vector<uint8_t>> {
+                    auto chunk = cm->get_chunk(chunk_id);
+                    if (!chunk) return nullptr;
+                    return std::shared_ptr<const std::vector<uint8_t>>(chunk, &chunk->data());
+                });
+        }
         transfer->set_chunk_data_consumer(
             [cm = cache](const std::string& chunk_id, const std::vector<uint8_t>& data) {
                 return cm->store_chunk(chunk_id, data);
@@ -392,8 +399,74 @@ int main() {
     auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     std::cout << "  [INFO] A repeat (local cache) fetch took " << ms2 << " ms\n";
 
+    // ---- 7. Malicious peer poisoning attempt ------------------------------
+    std::cout << "\n=== 7. Poisoned peer cannot win the race ===\n";
+    // Node C serves WRONG bytes for chunk 0 (16MB of 0xEE) but with a
+    // consistent self-reported hash - the classic poisoning attack. The
+    // origin-anchored hash in A's meta must reject it; honest B still wins.
+    TestNode c;
+    c.name = "NodeC(evil)";
+    c.scheduler = scheduler;
+    c.p2p.listen_port = 19203;
+    c.p2p.gossip_port = 19303;
+    c.p2p.gossip_interval_sec = 2;
+    c.proxy_cfg.listen_port = 18282;
+    c.proxy_cfg.bind_address = "127.0.0.1";
+    c.cache_cfg.memory_cache_size_mb = 64;
+    c.cache_cfg.disk_cache_path = "";
+    c.storage_cfg = b.storage_cfg;
+    c.storage_cfg.endpoint = "http://localhost:19998";  // also dead
+    c.provider_override =
+        [chunk0_id = chunk0](const std::string& chunk_id) -> std::shared_ptr<const std::vector<uint8_t>> {
+            if (chunk_id == chunk0_id) {
+                return std::make_shared<const std::vector<uint8_t>>(16u * 1024 * 1024, 0xEE);
+            }
+            return nullptr;
+        };
+    if (!c.start("node-c", "/tmp/e2e-cache-c")) return 1;
+
+    PeerNode c_info;
+    c_info.node_id = "node-c";
+    c_info.address = "127.0.0.1";
+    c_info.port = 19203;
+    c_info.gossip_port = 19303;
+    c_info.last_seen = static_cast<uint64_t>(std::time(nullptr));
+    a.discovery->add_peer(c_info);
+    b.discovery->add_peer(c_info);
+    c.discovery->add_peer(a_info);
+    c.discovery->add_peer(b_info);
+
+    // C claims it has chunk 0 (lies about content, but announce is legit)
+    c.discovery->announce_chunk(chunk0);
+
+    // A must forget chunk 0 so it is forced back onto the network
+    a.cache->remove_chunk(chunk0);
+
+    // Give the announce a moment to propagate
+    bool c_known = false;
+    for (int i = 0; i < 30 && !c_known; ++i) {
+        auto peers = a.discovery->get_peers_with_chunk(chunk0);
+        for (const auto& p : peers) {
+            if (p.node_id == "node-c") { c_known = true; break; }
+        }
+        if (!c_known) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    check(c_known, "A learned that (evil) C claims chunk 0");
+
+    // A fetches a slice covering chunk 0 only; the race includes C's
+    // poisoned copy which MUST lose against the origin-anchored hash.
+    auto rp = http_get(18280, medium_obj, "Range: bytes=0-99\r\n");
+    check(rp && rp->status == 206, "A: range fetch with evil peer still 206");
+    if (rp && rp->body.size() == 100 && rb) {
+        check(std::memcmp(rp->body.data(), rb->body.data(), 100) == 0,
+              "A: bytes are the origin's, not the poisoned copy");
+    } else {
+        check(false, "A: range fetch returns 100 bytes under attack");
+    }
+
     // ---- Teardown ----------------------------------------------------------
     std::cout << "\n=== Stopping nodes ===\n";
+    c.stop();
     a.stop();
     b.stop();
     scheduler->shutdown();

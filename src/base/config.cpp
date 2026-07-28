@@ -226,10 +226,16 @@ void Config::override_from_env() {
     if (const char* val = std::getenv("ELIOP2P_P2P_PORT")) {
         config_.p2p.listen_port = std::stoi(val);
     }
+    if (const char* val = std::getenv("ELIOP2P_P2P_GOSSIP_PORT")) {
+        config_.p2p.gossip_port = std::stoi(val);
+    }
 
     // Proxy
     if (const char* val = std::getenv("ELIOP2P_PROXY_PORT")) {
         config_.proxy.listen_port = std::stoi(val);
+    }
+    if (const char* val = std::getenv("ELIOP2P_PROXY_ALLOWED_BUCKET")) {
+        config_.proxy.allowed_bucket = val;
     }
 }
 

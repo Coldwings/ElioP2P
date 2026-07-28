@@ -102,6 +102,11 @@ struct ProxyConfig {
     uint32_t max_connections = 1000;
     std::string auth_type = "none";  // none, basic, token
     std::optional<std::string> auth_token;
+    // Optional bucket allowlist: when non-empty, only requests for this
+    // bucket are served (others get 403). Prevents the proxy from being
+    // used as an open relay to arbitrary buckets when deployed without
+    // client authentication.
+    std::string allowed_bucket;
 };
 
 // Global configuration

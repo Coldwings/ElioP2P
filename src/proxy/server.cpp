@@ -43,6 +43,9 @@ ProxyServer::ProxyServer(const ProxyConfig& config,
     impl_->cache_manager = cache_manager;
     impl_->storage_client = storage_client;
     impl_->request_handler = std::make_shared<RequestHandler>(cache_manager, storage_client);
+    if (!impl_->config.allowed_bucket.empty()) {
+        impl_->request_handler->set_allowed_bucket(impl_->config.allowed_bucket);
+    }
 }
 
 ProxyServer::~ProxyServer() {
