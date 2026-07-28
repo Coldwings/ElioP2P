@@ -4,6 +4,7 @@
 #include <elio/net/tcp.hpp>
 #include <elio/sync/primitives.hpp>
 #include <elio/time/timer.hpp>
+#include <elio/hash/sha256.hpp>
 #include <chrono>
 #include <fstream>
 #include <algorithm>
@@ -22,10 +23,17 @@ BandwidthLimiter::BandwidthLimiter(uint64_t max_mbps)
       last_reset_(std::chrono::steady_clock::now()) {}
 
 elio::coro::task<void> BandwidthLimiter::acquire(uint64_t bytes) {
+    uint64_t wait_time_ms = 0;
+
     // Use spinlock for short critical sections
     // Note: Must release lock before co_await to avoid blocking other coroutines
     {
         elio::sync::spinlock_guard lock(mutex_);
+
+        // 0 means unlimited (matches P2PConfig convention)
+        if (max_bytes_per_sec_ == 0) {
+            co_return;
+        }
 
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_reset_).count();
@@ -40,13 +48,15 @@ elio::coro::task<void> BandwidthLimiter::acquire(uint64_t bytes) {
             co_return;
         }
 
-        // Calculate wait time while holding lock, then release
-        wait_time_ms_ = ((bytes - available_) * 1000) / std::max<uint64_t>(max_bytes_per_sec_ / 1024, 1);
+        // Calculate wait time while holding lock, then release.
+        // wait_time is a coroutine-local value: concurrent acquirers must not
+        // share it (it used to be a member and got clobbered).
+        wait_time_ms = ((bytes - available_) * 1000) / std::max<uint64_t>(max_bytes_per_sec_ / 1024, 1);
         available_ = 0;
     } // Lock released here
 
     // Wait outside the lock to not block other coroutines
-    co_await elio::time::sleep_for(std::chrono::milliseconds(wait_time_ms_));
+    co_await elio::time::sleep_for(std::chrono::milliseconds(wait_time_ms));
 }
 
 void BandwidthLimiter::set_limit(uint64_t mbps) {
@@ -58,6 +68,71 @@ void BandwidthLimiter::set_limit(uint64_t mbps) {
 uint64_t BandwidthLimiter::available_bytes() const {
     elio::sync::spinlock_guard lock(mutex_);
     return available_;
+}
+
+// ---------------------------------------------------------------------------
+// Wire protocol helpers
+//
+// ChunkMessageHeader is a packed struct placed directly on the wire. All
+// multi-byte integer fields are converted to/from network byte order at the
+// boundary so mixed-endianness peers interoperate.
+// ---------------------------------------------------------------------------
+
+static ChunkMessageHeader header_to_wire(ChunkMessageHeader h) {
+    h.magic = htonl(h.magic);
+    h.version = htonl(h.version);
+    h.message_type = htonl(h.message_type);
+    h.chunk_id_length = htonl(h.chunk_id_length);
+    h.data_length = htonl(h.data_length);
+    h.sequence_number = htonl(h.sequence_number);
+    // hash[32] and flags are byte arrays, no conversion needed
+    return h;
+}
+
+static ChunkMessageHeader header_from_wire(ChunkMessageHeader h) {
+    h.magic = ntohl(h.magic);
+    h.version = ntohl(h.version);
+    h.message_type = ntohl(h.message_type);
+    h.chunk_id_length = ntohl(h.chunk_id_length);
+    h.data_length = ntohl(h.data_length);
+    h.sequence_number = ntohl(h.sequence_number);
+    return h;
+}
+
+// Read exactly n bytes (TCP may deliver short reads). Returns bytes actually
+// read; anything < n means EOF or error before the buffer was filled.
+static elio::coro::task<ssize_t> read_exact(elio::net::tcp_stream& stream, void* buf, size_t n) {
+    size_t total = 0;
+    auto* p = static_cast<char*>(buf);
+    while (total < n) {
+        auto r = co_await stream.read(p + total, n - total);
+        if (r.result <= 0) {
+            break;
+        }
+        total += static_cast<size_t>(r.result);
+    }
+    co_return static_cast<ssize_t>(total);
+}
+
+// Write exactly n bytes (stream.write may accept short writes). Returns
+// false on the first short/error write.
+static elio::coro::task<bool> write_exact(elio::net::tcp_stream& stream, const void* buf, size_t n) {
+    size_t total = 0;
+    const auto* p = static_cast<const char*>(buf);
+    while (total < n) {
+        auto r = co_await stream.write(p + total, n - total);
+        if (r.result <= 0) {
+            co_return false;
+        }
+        total += static_cast<size_t>(r.result);
+    }
+    co_return true;
+}
+
+// Compute raw SHA256 digest (32 bytes) of a buffer
+static void sha256_raw(const uint8_t* data, size_t size, uint8_t out[32]) {
+    auto digest = elio::hash::sha256(data, size);
+    std::memcpy(out, digest.data(), 32);
 }
 
 // TransferManager implementation
@@ -91,6 +166,9 @@ struct TransferManager::Impl {
 
     // Chunk data provider callback
     TransferManager::ChunkDataProvider chunk_data_provider;
+
+    // Chunk data consumer callback (stores chunks received via Upload)
+    TransferManager::ChunkDataConsumer chunk_data_consumer;
 
     Impl(const P2PConfig& cfg) : config(cfg) {
         upload_limiter = std::make_unique<BandwidthLimiter>(cfg.max_upload_speed_mbps);
@@ -128,14 +206,13 @@ struct TransferManager::Impl {
     // TCP server: handle incoming chunk request
     elio::coro::task<void> handle_chunk_request(elio::net::tcp_stream stream) {
         try {
-            // Read request header
+            // Read request header (loop: TCP delivers short reads)
             ChunkMessageHeader header;
-            auto read_result = co_await stream.read(&header, sizeof(header));
-
-            if (read_result.result != sizeof(header)) {
+            if (co_await read_exact(stream, &header, sizeof(header)) != static_cast<ssize_t>(sizeof(header))) {
                 Logger::instance().warning("Invalid chunk request header size");
                 co_return;
             }
+            header = header_from_wire(header);
 
             // Validate magic
             if (header.magic != CHUNK_TRANSFER_MAGIC) {
@@ -150,14 +227,59 @@ struct TransferManager::Impl {
             }
 
             std::vector<char> chunk_id_buf(header.chunk_id_length);
-            auto id_result = co_await stream.read(chunk_id_buf.data(), header.chunk_id_length);
-            if (id_result.result != static_cast<ssize_t>(header.chunk_id_length)) {
+            if (co_await read_exact(stream, chunk_id_buf.data(), header.chunk_id_length) !=
+                static_cast<ssize_t>(header.chunk_id_length)) {
                 Logger::instance().warning("Failed to read chunk ID");
                 co_return;
             }
 
             std::string chunk_id(chunk_id_buf.begin(), chunk_id_buf.end());
             Logger::instance().debug("Chunk request for: " + chunk_id);
+
+            // Upload: the peer is pushing chunk data to us; store it via the
+            // registered consumer and acknowledge with the received SHA256.
+            if (header.message_type == static_cast<uint32_t>(ChunkMessageType::Upload)) {
+                constexpr uint32_t MAX_UPLOAD_BYTES = 64 * 1024 * 1024;  // 4x CHUNK_SIZE
+                if (header.data_length == 0 || header.data_length > MAX_UPLOAD_BYTES) {
+                    Logger::instance().warning("Invalid upload data length: " +
+                                               std::to_string(header.data_length));
+                    co_return;
+                }
+
+                std::vector<uint8_t> data(header.data_length);
+                if (co_await read_exact(stream, data.data(), data.size()) !=
+                    static_cast<ssize_t>(data.size())) {
+                    Logger::instance().warning("Failed to read upload data for: " + chunk_id);
+                    co_return;
+                }
+
+                bool accepted = false;
+                if (chunk_data_consumer) {
+                    accepted = chunk_data_consumer(chunk_id, data);
+                }
+
+                ChunkMessageHeader ack{};
+                ack.magic = CHUNK_TRANSFER_MAGIC;
+                ack.version = CHUNK_TRANSFER_VERSION;
+                ack.message_type = static_cast<uint32_t>(
+                    accepted ? ChunkMessageType::Ack : ChunkMessageType::Error);
+                ack.chunk_id_length = header.chunk_id_length;
+                ack.data_length = 0;
+                ack.flags = 0;
+                if (accepted) {
+                    sha256_raw(data.data(), data.size(), ack.hash);
+                }
+
+                auto ack_wire = header_to_wire(ack);
+                if (co_await write_exact(stream, &ack_wire, sizeof(ack_wire))) {
+                    co_await write_exact(stream, chunk_id.data(), chunk_id.size());
+                }
+                co_await stream.close();
+                Logger::instance().info(std::string(accepted ? "Stored uploaded chunk: " :
+                                                               "Rejected uploaded chunk: ") +
+                                        chunk_id + " (" + std::to_string(data.size()) + " bytes)");
+                co_return;
+            }
 
             // Check if we have this chunk
             std::optional<std::vector<uint8_t>> chunk_data;
@@ -175,20 +297,17 @@ struct TransferManager::Impl {
                 resp_header.data_length = 0;
                 resp_header.flags = 0;
 
-                auto write_result = co_await stream.write(&resp_header, sizeof(resp_header));
-                if (write_result.result == sizeof(resp_header)) {
-                    co_await stream.write(chunk_id_buf.data(), header.chunk_id_length);
+                auto wire = header_to_wire(resp_header);
+                if (co_await write_exact(stream, &wire, sizeof(wire))) {
+                    co_await write_exact(stream, chunk_id_buf.data(), header.chunk_id_length);
                 }
                 Logger::instance().warning("Chunk not found: " + chunk_id);
                 co_await stream.close();
                 co_return;
             }
 
-            // Calculate hash
-            // Note: In real implementation, use proper SHA256
-            // For now, we'll use a placeholder
-
-            // Send response with chunk data
+            // Send response with chunk data, integrity hash included so the
+            // receiver can detect corruption (was a placeholder before).
             ChunkMessageHeader resp_header{};
             resp_header.magic = CHUNK_TRANSFER_MAGIC;
             resp_header.version = CHUNK_TRANSFER_VERSION;
@@ -197,24 +316,37 @@ struct TransferManager::Impl {
             resp_header.data_length = static_cast<uint32_t>(chunk_data->size());
             resp_header.sequence_number = 0;
             resp_header.flags = ChunkMessageHeader::FLAG_LAST_PART;
+            sha256_raw(chunk_data->data(), chunk_data->size(), resp_header.hash);
 
-            // Send header
-            auto hdr_result = co_await stream.write(&resp_header, sizeof(resp_header));
-            if (hdr_result.result != sizeof(resp_header)) {
+            auto wire = header_to_wire(resp_header);
+            if (!co_await write_exact(stream, &wire, sizeof(wire))) {
                 Logger::instance().error("Failed to send response header");
                 co_await stream.close();
                 co_return;
             }
-            // Send chunk_id
-            auto id_send_result = co_await stream.write(chunk_id_buf.data(), header.chunk_id_length);
-            if (id_send_result.result != static_cast<ssize_t>(header.chunk_id_length)) {
+            if (!co_await write_exact(stream, chunk_id_buf.data(), header.chunk_id_length)) {
                 Logger::instance().error("Failed to send chunk_id");
                 co_await stream.close();
                 co_return;
             }
-            // Send data
-            auto data_result = co_await stream.write(chunk_data->data(), chunk_data->size());
-            if (data_result.result != static_cast<ssize_t>(chunk_data->size())) {
+
+            // Send data in slices so upload bandwidth limiting actually
+            // applies mid-stream instead of only once per chunk
+            constexpr size_t SLICE = 256 * 1024;
+            size_t sent = 0;
+            bool send_ok = true;
+            while (sent < chunk_data->size()) {
+                size_t slice = std::min(SLICE, chunk_data->size() - sent);
+                if (upload_limiter) {
+                    co_await upload_limiter->acquire(slice);
+                }
+                if (!co_await write_exact(stream, chunk_data->data() + sent, slice)) {
+                    send_ok = false;
+                    break;
+                }
+                sent += slice;
+            }
+            if (!send_ok) {
                 Logger::instance().error("Failed to send chunk data");
                 co_await stream.close();
                 co_return;
@@ -349,6 +481,10 @@ void TransferManager::set_chunk_data_provider(ChunkDataProvider provider) {
     impl_->chunk_data_provider = std::move(provider);
 }
 
+void TransferManager::set_chunk_data_consumer(ChunkDataConsumer consumer) {
+    impl_->chunk_data_consumer = std::move(consumer);
+}
+
 // K-selection algorithm: select K best peers based on transfer mode
 PeerList TransferManager::select_k_peers(const PeerList& candidates, uint32_t k, TransferMode mode) const {
     if (candidates.empty()) {
@@ -414,19 +550,24 @@ PeerList TransferManager::select_k_peers(const PeerList& candidates, uint32_t k,
     return result;
 }
 
-// Helper function: download from a single peer with failure handling
-// Returns: pair<success, bytes_downloaded>
-elio::coro::task<std::pair<bool, uint64_t>> download_from_peer(
+// Result of a single-peer download attempt
+struct PeerDownloadResult {
+    bool success = false;
+    uint64_t bytes_downloaded = 0;
+    std::vector<uint8_t> data;
+};
+
+// Download the full chunk from a single peer into a PRIVATE buffer.
+// Multiple of these race each other in hedged mode: the caller adopts the
+// first verified result and signals ctx->stop_flag to abort the rest.
+elio::coro::task<PeerDownloadResult> download_from_peer(
     BandwidthLimiter* download_limiter,
     std::shared_ptr<ChunkTransferContext> ctx,
-    const PeerNode& peer,
-    std::vector<uint8_t>& result_buffer,
-    TransferProgress& progress,
-    TransferProgressCallback progress_callback,
-    bool& running) {
+    PeerNode peer,
+    TransferProgressCallback progress_callback) {
 
-    uint64_t downloaded_from_peer = 0;
-    const uint64_t chunk_size = 256 * 1024;  // 256KB chunks
+    PeerDownloadResult result;
+    const uint64_t slice_size = 256 * 1024;
 
     try {
         Logger::instance().debug("Starting TCP download from peer: " + peer.node_id + " at " + peer.address + ":" + std::to_string(peer.port));
@@ -439,290 +580,143 @@ elio::coro::task<std::pair<bool, uint64_t>> download_from_peer(
             elio::net::socket_address(peer.address, peer.port), opts);
         if (!connect_result) {
             Logger::instance().error("Failed to connect to peer: " + peer.node_id);
-            co_return std::make_pair(false, 0);
+            co_return result;
         }
 
         elio::net::tcp_stream& stream = *connect_result;
 
         // Build and send request
-        std::string chunk_id = ctx->chunk_id;
+        const std::string& chunk_id = ctx->chunk_id;
 
-        // Build request header
         ChunkMessageHeader header{};
         header.magic = CHUNK_TRANSFER_MAGIC;
         header.version = CHUNK_TRANSFER_VERSION;
         header.message_type = static_cast<uint32_t>(ChunkMessageType::Request);
         header.chunk_id_length = static_cast<uint32_t>(chunk_id.size());
-        header.data_length = 0;  // No data in request
+        header.data_length = 0;
         header.sequence_number = 0;
         header.flags = ctx->is_resume ? ChunkMessageHeader::FLAG_RESUME : 0;
 
-        // Send header
-        auto write_result = co_await stream.write(&header, sizeof(header));
-        if (write_result.result != sizeof(header)) {
+        auto wire = header_to_wire(header);
+        if (!co_await write_exact(stream, &wire, sizeof(wire))) {
             Logger::instance().error("Failed to send request header to peer: " + peer.node_id);
             co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
+            co_return result;
         }
 
-        // Send chunk_id
-        auto id_result = co_await stream.write(chunk_id.data(), chunk_id.size());
-        if (id_result.result != static_cast<ssize_t>(chunk_id.size())) {
+        if (!co_await write_exact(stream, chunk_id.data(), chunk_id.size())) {
             Logger::instance().error("Failed to send chunk_id to peer: " + peer.node_id);
             co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
+            co_return result;
         }
 
         // Read response header
         ChunkMessageHeader resp_header;
-        auto read_result = co_await stream.read(&resp_header, sizeof(resp_header));
-        if (read_result.result != sizeof(resp_header)) {
+        if (co_await read_exact(stream, &resp_header, sizeof(resp_header)) !=
+            static_cast<ssize_t>(sizeof(resp_header))) {
             Logger::instance().error("Failed to read response header from peer: " + peer.node_id);
             co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
+            co_return result;
         }
+        resp_header = header_from_wire(resp_header);
 
-        // Validate response
         if (resp_header.magic != CHUNK_TRANSFER_MAGIC) {
             Logger::instance().error("Invalid magic in response from peer: " + peer.node_id);
             co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
+            co_return result;
         }
 
         if (resp_header.message_type == static_cast<uint32_t>(ChunkMessageType::Error)) {
             Logger::instance().error("Peer returned error for chunk: " + ctx->chunk_id);
             co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
+            co_return result;
         }
 
         if (resp_header.message_type != static_cast<uint32_t>(ChunkMessageType::Response)) {
             Logger::instance().error("Unexpected message type from peer: " + peer.node_id);
             co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
+            co_return result;
         }
 
-        // Read chunk data
-        uint64_t total_data_length = resp_header.data_length;
-        result_buffer.reserve(total_data_length);
+        // Read chunk data into the private buffer
+        const uint64_t total_data_length = resp_header.data_length;
+        result.data.reserve(total_data_length);
 
-        uint64_t offset = 0;
-        while (offset < total_data_length) {
-            if (!running) {
-                Logger::instance().warning("Transfer cancelled");
+        TransferProgress progress;
+        progress.chunk_id = ctx->chunk_id;
+        progress.total_bytes = ctx->total_size;
+        progress.current_peer = peer.node_id;
+
+        while (result.bytes_downloaded < total_data_length) {
+            // Hedged mode: another peer already won, or explicit cancel
+            if (ctx->stop_flag->load(std::memory_order_relaxed)) {
+                Logger::instance().info("Download from peer " + peer.node_id + " aborted (race lost or cancelled)");
                 co_await stream.close();
-                co_return std::make_pair(false, downloaded_from_peer);
+                result.data.clear();
+                result.data.shrink_to_fit();
+                co_return result;
             }
 
-            // Apply bandwidth limiting
+            uint64_t read_size = std::min(slice_size, total_data_length - result.bytes_downloaded);
+
             if (download_limiter) {
-                uint64_t bytes_to_transfer = std::min(chunk_size, total_data_length - offset);
-                co_await download_limiter->acquire(bytes_to_transfer);
+                co_await download_limiter->acquire(read_size);
             }
 
-            // Read data from TCP
-            uint64_t read_size = std::min(chunk_size, total_data_length - offset);
-            std::vector<uint8_t> chunk_data(read_size);
-            auto data_result = co_await stream.read(chunk_data.data(), read_size);
-
-            if (data_result.result <= 0) {
+            std::vector<uint8_t> slice(read_size);
+            auto got = co_await read_exact(stream, slice.data(), read_size);
+            if (got <= 0) {
                 Logger::instance().error("Connection closed while reading data from peer: " + peer.node_id);
                 co_await stream.close();
-                co_return std::make_pair(false, downloaded_from_peer);
+                result.data.clear();
+                co_return result;
             }
 
-            result_buffer.insert(result_buffer.end(), chunk_data.begin(), chunk_data.begin() + data_result.result);
-            downloaded_from_peer += data_result.result;
-            offset += data_result.result;
+            slice.resize(static_cast<size_t>(got));
+            result.data.insert(result.data.end(), slice.begin(), slice.end());
+            result.bytes_downloaded += static_cast<uint64_t>(got);
 
-            ctx->downloaded_size += data_result.result;
-            progress.bytes_transferred = ctx->downloaded_size;
-            progress.progress_percent = (double)ctx->downloaded_size / ctx->total_size * 100.0;
-            progress.current_peer = peer.node_id;
-
-            // Report progress
+            // Per-peer progress (no shared counters - races otherwise)
+            progress.bytes_transferred = result.bytes_downloaded;
+            progress.progress_percent = ctx->total_size > 0
+                ? static_cast<double>(result.bytes_downloaded) / ctx->total_size * 100.0
+                : 0.0;
             if (progress_callback) {
                 progress_callback(progress);
-            }
-
-            // Checkpoint every 1MB
-            if (ctx->downloaded_size - ctx->last_checkpoint_size >= ChunkTransferContext::CHECKPOINT_INTERVAL) {
-                ctx->last_checkpoint_size = ctx->downloaded_size;
-                Logger::instance().debug("Checkpoint saved at " + std::to_string(ctx->downloaded_size) + " bytes");
             }
         }
 
         // Close socket
         co_await stream.close();
 
-        Logger::instance().info("Successfully downloaded " + std::to_string(downloaded_from_peer) +
+        // Integrity check: SHA256 over the received data must match the
+        // hash the sender put in the response header
+        uint8_t computed[32];
+        sha256_raw(result.data.data(), result.data.size(), computed);
+        if (std::memcmp(computed, resp_header.hash, 32) != 0) {
+            Logger::instance().error("SHA256 mismatch for chunk " + ctx->chunk_id +
+                                     " from peer " + peer.node_id + ", discarding");
+            result.data.clear();
+            result.bytes_downloaded = 0;
+            co_return result;
+        }
+
+        Logger::instance().info("Successfully downloaded " + std::to_string(result.bytes_downloaded) +
                                " bytes from peer: " + peer.node_id);
-        co_return std::make_pair(true, downloaded_from_peer);
+        result.success = true;
+        co_return result;
 
     } catch (const std::exception& e) {
         Logger::instance().error("Download failed from peer " + peer.node_id + ": " + e.what());
-        co_return std::make_pair(false, downloaded_from_peer);
+        result.data.clear();
+        co_return result;
     } catch (...) {
         Logger::instance().error("Unknown error downloading from peer: " + peer.node_id);
-        co_return std::make_pair(false, downloaded_from_peer);
+        result.data.clear();
+        co_return result;
     }
 }
 
-// Helper function: download to file from a single peer with failure handling
-// Returns: pair<success, bytes_downloaded>
-elio::coro::task<std::pair<bool, uint64_t>> download_from_peer_to_file(
-    BandwidthLimiter* download_limiter,
-    std::shared_ptr<ChunkTransferContext> ctx,
-    const PeerNode& peer,
-    std::ofstream& out_file,
-    TransferProgress& progress,
-    TransferProgressCallback progress_callback,
-    bool& running) {
-
-    uint64_t downloaded_from_peer = 0;
-    const uint64_t chunk_size = 256 * 1024;  // 256KB chunks
-
-    try {
-        Logger::instance().debug("Starting TCP file download from peer: " + peer.node_id + " at " + peer.address + ":" + std::to_string(peer.port));
-
-        // Establish TCP connection to peer
-        elio::net::tcp_options opts;
-        opts.no_delay = true;
-
-        auto connect_result = co_await elio::net::tcp_connect(
-            elio::net::socket_address(peer.address, peer.port), opts);
-        if (!connect_result) {
-            Logger::instance().error("Failed to connect to peer for file download: " + peer.node_id);
-            co_return std::make_pair(false, 0);
-        }
-
-        elio::net::tcp_stream& stream = *connect_result;
-
-        // Build and send request
-        std::string chunk_id = ctx->chunk_id;
-
-        // Build request header
-        ChunkMessageHeader header{};
-        header.magic = CHUNK_TRANSFER_MAGIC;
-        header.version = CHUNK_TRANSFER_VERSION;
-        header.message_type = static_cast<uint32_t>(ChunkMessageType::Request);
-        header.chunk_id_length = static_cast<uint32_t>(chunk_id.size());
-        header.data_length = 0;  // No data in request
-        header.sequence_number = 0;
-        header.flags = ctx->is_resume ? ChunkMessageHeader::FLAG_RESUME : 0;
-
-        // Send header
-        auto write_result = co_await stream.write(&header, sizeof(header));
-        if (write_result.result != sizeof(header)) {
-            Logger::instance().error("Failed to send request header to peer: " + peer.node_id);
-            co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
-        }
-
-        // Send chunk_id
-        auto id_result = co_await stream.write(chunk_id.data(), chunk_id.size());
-        if (id_result.result != static_cast<ssize_t>(chunk_id.size())) {
-            Logger::instance().error("Failed to send chunk_id to peer: " + peer.node_id);
-            co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
-        }
-
-        // Read response header
-        ChunkMessageHeader resp_header;
-        auto read_result = co_await stream.read(&resp_header, sizeof(resp_header));
-        if (read_result.result != sizeof(resp_header)) {
-            Logger::instance().error("Failed to read response header from peer: " + peer.node_id);
-            co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
-        }
-
-        // Validate response
-        if (resp_header.magic != CHUNK_TRANSFER_MAGIC) {
-            Logger::instance().error("Invalid magic in response from peer: " + peer.node_id);
-            co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
-        }
-
-        if (resp_header.message_type == static_cast<uint32_t>(ChunkMessageType::Error)) {
-            Logger::instance().error("Peer returned error for chunk: " + ctx->chunk_id);
-            co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
-        }
-
-        if (resp_header.message_type != static_cast<uint32_t>(ChunkMessageType::Response)) {
-            Logger::instance().error("Unexpected message type from peer: " + peer.node_id);
-            co_await stream.close();
-            co_return std::make_pair(false, downloaded_from_peer);
-        }
-
-        // Read chunk data and write to file
-        uint64_t total_data_length = resp_header.data_length;
-        uint64_t offset = 0;
-
-        while (offset < total_data_length) {
-            if (!running) {
-                Logger::instance().warning("Transfer cancelled");
-                co_await stream.close();
-                co_return std::make_pair(false, downloaded_from_peer);
-            }
-
-            // Apply bandwidth limiting
-            if (download_limiter) {
-                uint64_t bytes_to_transfer = std::min(chunk_size, total_data_length - offset);
-                co_await download_limiter->acquire(bytes_to_transfer);
-            }
-
-            // Read data from TCP
-            uint64_t read_size = std::min(chunk_size, total_data_length - offset);
-            std::vector<uint8_t> buffer(read_size);
-            auto data_result = co_await stream.read(buffer.data(), read_size);
-
-            if (data_result.result <= 0) {
-                Logger::instance().error("Connection closed while reading data from peer: " + peer.node_id);
-                co_await stream.close();
-                co_return std::make_pair(false, downloaded_from_peer);
-            }
-
-            // Write to file
-            out_file.write(reinterpret_cast<const char*>(buffer.data()), data_result.result);
-            downloaded_from_peer += data_result.result;
-            offset += data_result.result;
-
-            ctx->downloaded_size += data_result.result;
-            progress.bytes_transferred = ctx->downloaded_size;
-            progress.progress_percent = (double)ctx->downloaded_size / ctx->total_size * 100.0;
-            progress.current_peer = peer.node_id;
-
-            // Report progress
-            if (progress_callback) {
-                progress_callback(progress);
-            }
-
-            // Flush every 1MB
-            if (ctx->downloaded_size - ctx->last_checkpoint_size >= ChunkTransferContext::CHECKPOINT_INTERVAL) {
-                out_file.flush();
-                ctx->last_checkpoint_size = ctx->downloaded_size;
-                Logger::instance().debug("Checkpoint saved at " + std::to_string(ctx->downloaded_size) + " bytes");
-            }
-        }
-
-        // Final flush
-        out_file.flush();
-
-        // Close socket
-        co_await stream.close();
-
-        Logger::instance().info("Successfully downloaded " + std::to_string(downloaded_from_peer) +
-                               " bytes to file from peer: " + peer.node_id);
-        co_return std::make_pair(true, downloaded_from_peer);
-
-    } catch (const std::exception& e) {
-        Logger::instance().error("File download failed from peer " + peer.node_id + ": " + e.what());
-        co_return std::make_pair(false, downloaded_from_peer);
-    } catch (...) {
-        Logger::instance().error("Unknown error downloading file from peer: " + peer.node_id);
-        co_return std::make_pair(false, downloaded_from_peer);
-    }
-}
 
 elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_chunk(
     const TransferRequest& request,
@@ -779,54 +773,46 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_
     Logger::instance().info("Selected " + std::to_string(selected_peers.size()) +
                             " peers for parallel download");
 
-    // TRUE PARALLEL DOWNLOAD: spawn tasks for all selected peers concurrently
-    // Each peer downloads the entire chunk (or a portion) in parallel
-    // If one peer fails, we can switch to backup peers
-
+    // Hedged parallel download: selected peers race on PRIVATE buffers.
+    // The first peer returning a complete, SHA256-verified copy wins;
+    // ctx->stop_flag then aborts the remaining downloads. This replaces the
+    // old design where every peer wrote into one shared buffer (data race +
+    // guaranteed corruption) and all K transfers always ran to completion.
     TransferProgress progress;
     progress.chunk_id = request.chunk_id;
     progress.total_bytes = ctx->total_size;
-
-    bool download_success = false;
-    bool transfer_running = true;
-
-    // Create parallel download tasks for all selected peers
-    std::vector<elio::coro::join_handle<std::pair<bool, uint64_t>>> download_tasks;
-
     for (const auto& peer : selected_peers) {
         progress.active_peers.push_back(peer.node_id);
     }
 
-    // Launch all peer downloads in parallel using spawn()
-    for (size_t i = 0; i < selected_peers.size(); ++i) {
-        const auto& peer = selected_peers[i];
-        auto download_task = impl_->scheduler->go_joinable(
+    std::vector<elio::coro::join_handle<PeerDownloadResult>> download_tasks;
+    for (const auto& peer : selected_peers) {
+        download_tasks.push_back(impl_->scheduler->go_joinable(
             download_from_peer,
             impl_->download_limiter.get(),
             ctx,
             peer,
-            std::ref(result),
-            std::ref(progress),
-            progress_callback,
-            std::ref(transfer_running));
-        download_tasks.push_back(std::move(download_task));
+            progress_callback));
     }
 
-    // Wait for all parallel downloads to complete
-    // Using a simple approach: wait for first to succeed, or all to fail
-    uint64_t successful_peers = 0;
-
+    bool download_success = false;
     for (auto& task : download_tasks) {
-        auto [success, bytes_downloaded] = co_await task;
-        if (success) {
-            successful_peers++;
+        auto r = co_await task;
+        if (download_success) {
+            continue;  // race already decided; drain quietly
+        }
+        if (r.success) {
+            // First verified winner: adopt its data and abort the others
+            ctx->stop_flag->store(true, std::memory_order_relaxed);
+            ctx->downloaded_size = r.bytes_downloaded;
+            result = std::move(r.data);
             download_success = true;
-            Logger::instance().info("Parallel download succeeded from one peer, " +
-                                   std::to_string(successful_peers) + " total successful");
+            Logger::instance().info("Hedged download won by a peer, " +
+                                    std::to_string(r.bytes_downloaded) + " bytes verified");
         }
     }
 
-    // If no peer succeeded, try fallback peers
+    // If no peer succeeded, try fallback peers one by one
     if (!download_success) {
         Logger::instance().warning("All primary peers failed, trying fallback peers");
 
@@ -845,28 +831,25 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_
             }
         }
 
-        // Try fallback peers one by one with failure handling
         for (const auto& peer : fallback_peers) {
-            if (!impl_->running) {
+            if (!impl_->running || ctx->stop_flag->load(std::memory_order_relaxed)) {
                 break;
             }
 
             Logger::instance().info("Trying fallback peer: " + peer.node_id);
 
             try {
-                auto [success, bytes_downloaded] = co_await download_from_peer(
+                auto r = co_await download_from_peer(
                     impl_->download_limiter.get(),
                     ctx,
                     peer,
-                    result,
-                    progress,
-                    progress_callback,
-                    transfer_running
-                );
+                    progress_callback);
 
-                if (success) {
+                if (r.success) {
+                    ctx->stop_flag->store(true, std::memory_order_relaxed);
+                    ctx->downloaded_size = r.bytes_downloaded;
+                    result = std::move(r.data);
                     download_success = true;
-                    successful_peers++;
                     Logger::instance().info("Fallback peer succeeded: " + peer.node_id);
                     break;
                 }
@@ -880,18 +863,19 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_
     if (!download_success) {
         Logger::instance().error("All peers failed for chunk: " + request.chunk_id);
         impl_->stats.failed_downloads++;
+        impl_->remove_transfer(request.chunk_id);
         co_return std::nullopt;
     }
 
     // Final checkpoint
-    save_progress(request.chunk_id, ctx->downloaded_size);
+    save_progress(request.chunk_id, ctx->downloaded_size.load());
 
     // Clean up progress file on success
     std::filesystem::remove(ctx->file_path);
     impl_->remove_transfer(request.chunk_id);
 
     progress.completed = true;
-    progress.bytes_transferred = ctx->downloaded_size;
+    progress.bytes_transferred = ctx->downloaded_size.load();
     progress.progress_percent = 100.0;
 
     if (progress_callback) {
@@ -901,8 +885,7 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_
     impl_->stats.total_bytes_downloaded += result.size();
 
     Logger::instance().info("Download completed for chunk: " + request.chunk_id +
-                            ", size: " + std::to_string(result.size()) + " bytes, " +
-                            std::to_string(successful_peers) + " successful peer(s)");
+                            ", size: " + std::to_string(result.size()) + " bytes");
 
     co_return result;
 }
@@ -918,173 +901,30 @@ elio::coro::task<bool> TransferManager::download_chunk_to_file(
 
     Logger::instance().info("Downloading chunk to file: " + request.chunk_id + " -> " + dest_path);
 
-    // Get transfer context
-    auto ctx = impl_->get_or_create_context(request.chunk_id, request.enable_resume);
-    ctx->file_path = dest_path;
-    ctx->total_size = request.expected_size > 0 ? request.expected_size : ChunkTransferContext::CHUNK_SIZE;
-
-    // Check for resume
-    uint64_t saved_offset = 0;
-    if (request.enable_resume && load_progress(request.chunk_id, saved_offset) && saved_offset > 0) {
-        ctx->is_resume = true;
-        ctx->downloaded_size = saved_offset;
+    // Reuse the hedged download_chunk (racing peers, private buffers, SHA256
+    // verification), then persist the winning copy. Chunks are bounded by
+    // CHUNK_SIZE (16MB) so holding one in memory is fine.
+    auto data = co_await download_chunk(request, progress_callback);
+    if (!data) {
+        co_return false;
     }
 
-    // Open file for writing
-    std::ofstream out_file;
-    if (ctx->is_resume) {
-        out_file.open(dest_path, std::ios::app | std::ios::binary);
-    } else {
-        out_file.open(dest_path, std::ios::out | std::ios::binary);
-    }
-
+    std::ofstream out_file(dest_path, std::ios::out | std::ios::binary);
     if (!out_file.is_open()) {
         Logger::instance().error("Failed to open file for writing: " + dest_path);
         co_return false;
     }
-
-    // Get candidates and select K peers
-    PeerList candidates;
-    if (!request.sources.empty()) {
-        candidates = request.sources;
-    } else if (impl_->node_discovery) {
-        candidates = impl_->node_discovery->get_peers_with_chunk(request.chunk_id);
-    }
-
-    if (candidates.empty()) {
-        Logger::instance().warning("No peers available for chunk: " + request.chunk_id);
-        co_return false;
-    }
-
-    uint32_t k = request.k_value > 0 ? request.k_value : impl_->config.selection_k;
-    PeerList selected_peers = select_k_peers(candidates, k, request.mode);
-
-    Logger::instance().info("Selected " + std::to_string(selected_peers.size()) +
-                            " peers for parallel file download");
-
-    TransferProgress progress;
-    progress.chunk_id = request.chunk_id;
-    progress.total_bytes = ctx->total_size;
-
-    bool download_success = false;
-    bool transfer_running = true;
-    uint64_t successful_peers = 0;
-
-    // TRUE PARALLEL DOWNLOAD: spawn tasks for all selected peers concurrently
-    // Each peer downloads the entire chunk (or a portion) in parallel
-    // If one peer fails, we can switch to backup peers
-
-    for (const auto& peer : selected_peers) {
-        progress.active_peers.push_back(peer.node_id);
-    }
-
-    // Launch all peer downloads in parallel using spawn()
-    std::vector<elio::coro::join_handle<std::pair<bool, uint64_t>>> download_tasks;
-
-    for (size_t i = 0; i < selected_peers.size(); ++i) {
-        const auto& peer = selected_peers[i];
-        auto download_task = impl_->scheduler->go_joinable(
-            download_from_peer_to_file,
-            impl_->download_limiter.get(),
-            ctx,
-            peer,
-            std::ref(out_file),
-            std::ref(progress),
-            progress_callback,
-            std::ref(transfer_running));
-        download_tasks.push_back(std::move(download_task));
-    }
-
-    // Wait for all parallel downloads to complete
-    for (auto& task : download_tasks) {
-        auto [success, bytes_downloaded] = co_await task;
-        if (success) {
-            successful_peers++;
-            download_success = true;
-            Logger::instance().info("Parallel file download succeeded from one peer, " +
-                                   std::to_string(successful_peers) + " total successful");
-        }
-    }
-
-    // If no peer succeeded, try fallback peers
-    if (!download_success) {
-        Logger::instance().warning("All primary peers failed, trying fallback peers");
-
-        // Get additional fallback peers (exclude already tried ones)
-        PeerList fallback_peers;
-        for (const auto& candidate : candidates) {
-            bool already_tried = false;
-            for (const auto& tried : selected_peers) {
-                if (candidate.node_id == tried.node_id) {
-                    already_tried = true;
-                    break;
-                }
-            }
-            if (!already_tried) {
-                fallback_peers.push_back(candidate);
-            }
-        }
-
-        // Try fallback peers one by one with failure handling
-        for (const auto& peer : fallback_peers) {
-            if (!impl_->running) {
-                break;
-            }
-
-            Logger::instance().info("Trying fallback peer for file: " + peer.node_id);
-
-            try {
-                auto [success, bytes_downloaded] = co_await download_from_peer_to_file(
-                    impl_->download_limiter.get(),
-                    ctx,
-                    peer,
-                    out_file,
-                    progress,
-                    progress_callback,
-                    transfer_running
-                );
-
-                if (success) {
-                    download_success = true;
-                    successful_peers++;
-                    Logger::instance().info("Fallback peer succeeded for file: " + peer.node_id);
-                    break;
-                }
-            } catch (const std::exception& e) {
-                Logger::instance().error("Fallback peer failed for file: " + std::string(e.what()));
-                // Continue to next fallback peer
-            }
-        }
-    }
-
-    if (!download_success) {
-        Logger::instance().error("All peers failed for chunk file download: " + request.chunk_id);
-        out_file.close();
-        co_return false;
-    }
-
-    // Final flush and checkpoint
+    out_file.write(reinterpret_cast<const char*>(data->data()),
+                   static_cast<std::streamsize>(data->size()));
     out_file.flush();
-    // Note: In production, you'd want to call fsync here for durability
-    // This requires opening the file with a separate file descriptor
-    save_progress(request.chunk_id, ctx->downloaded_size);
+    if (!out_file) {
+        Logger::instance().error("Failed to write chunk data to: " + dest_path);
+        co_return false;
+    }
     out_file.close();
 
-    // Clean up progress
-    std::filesystem::remove(ctx->file_path + ".progress");
-    impl_->remove_transfer(request.chunk_id);
-
-    progress.completed = true;
-    impl_->stats.total_bytes_downloaded += ctx->downloaded_size;
-
-    if (progress_callback) {
-        progress_callback(progress);
-    }
-
     Logger::instance().info("File download completed for chunk: " + request.chunk_id +
-                            ", size: " + std::to_string(ctx->downloaded_size) + " bytes, " +
-                            std::to_string(successful_peers) + " successful peer(s)");
-
+                            ", size: " + std::to_string(data->size()) + " bytes");
     co_return true;
 }
 
@@ -1117,68 +957,65 @@ elio::coro::task<bool> TransferManager::upload_chunk(
 
         elio::net::tcp_stream& stream = *connect_result;
 
-        // Build request header
+        // Build Upload header (wire format on send)
         ChunkMessageHeader header{};
         header.magic = CHUNK_TRANSFER_MAGIC;
         header.version = CHUNK_TRANSFER_VERSION;
-        header.message_type = static_cast<uint32_t>(ChunkMessageType::Request);
+        header.message_type = static_cast<uint32_t>(ChunkMessageType::Upload);
         header.chunk_id_length = static_cast<uint32_t>(chunk_id.size());
         header.data_length = static_cast<uint32_t>(data.size());
         header.sequence_number = 0;
         header.flags = ChunkMessageHeader::FLAG_LAST_PART;
 
-        // Send header
-        auto write_result = co_await stream.write(&header, sizeof(header));
-        if (write_result.result != sizeof(header)) {
+        auto wire = header_to_wire(header);
+        if (!co_await write_exact(stream, &wire, sizeof(wire))) {
             Logger::instance().error("Failed to send upload request header to peer: " + target_peer.node_id);
             impl_->stats.failed_uploads++;
             co_await stream.close();
             co_return false;
         }
 
-        // Send chunk_id
-        auto id_result = co_await stream.write(chunk_id.data(), chunk_id.size());
-        if (id_result.result != static_cast<ssize_t>(chunk_id.size())) {
+        if (!co_await write_exact(stream, chunk_id.data(), chunk_id.size())) {
             Logger::instance().error("Failed to send chunk_id to peer: " + target_peer.node_id);
             impl_->stats.failed_uploads++;
             co_await stream.close();
             co_return false;
         }
 
-        // Upload data in chunks with bandwidth limiting
-        const uint64_t chunk_size = 256 * 1024;  // 256KB chunks
+        // Upload data in slices with bandwidth limiting
+        const uint64_t slice_size = 256 * 1024;
         uint64_t offset = 0;
 
         while (offset < data.size()) {
-            // Apply bandwidth limiting before data transfer
+            uint64_t bytes_this_slice = std::min(slice_size, static_cast<uint64_t>(data.size()) - offset);
             if (impl_->upload_limiter) {
-                uint64_t bytes_to_transfer = std::min(chunk_size, static_cast<uint64_t>(data.size()) - offset);
-                co_await impl_->upload_limiter->acquire(bytes_to_transfer);
+                co_await impl_->upload_limiter->acquire(bytes_this_slice);
             }
 
-            // Send data chunk
-            uint64_t bytes_this_chunk = std::min(chunk_size, static_cast<uint64_t>(data.size()) - offset);
-            auto data_result = co_await stream.write(data.data() + offset, bytes_this_chunk);
-
-            if (data_result.result <= 0) {
+            if (!co_await write_exact(stream, data.data() + offset, bytes_this_slice)) {
                 Logger::instance().error("Connection closed while uploading to peer: " + target_peer.node_id);
                 impl_->stats.failed_uploads++;
                 co_await stream.close();
                 co_return false;
             }
-
-            offset += data_result.result;
+            offset += bytes_this_slice;
         }
 
-        // Read response
+        // Read Ack/Error response
         ChunkMessageHeader resp_header;
-        auto read_result = co_await stream.read(&resp_header, sizeof(resp_header));
-
-        if (read_result.result != sizeof(resp_header)) {
+        if (co_await read_exact(stream, &resp_header, sizeof(resp_header)) !=
+            static_cast<ssize_t>(sizeof(resp_header))) {
             Logger::instance().error("Failed to read upload response from peer: " + target_peer.node_id);
             impl_->stats.failed_uploads++;
             co_await stream.close();
             co_return false;
+        }
+        resp_header = header_from_wire(resp_header);
+
+        // The Ack carries the chunk_id again; consume it if present
+        if (resp_header.chunk_id_length > 0 && resp_header.chunk_id_length <= 256) {
+            std::vector<char> id_buf(resp_header.chunk_id_length);
+            co_await read_exact(stream, id_buf.data(), id_buf.size());
         }
 
         // Validate response
@@ -1189,8 +1026,19 @@ elio::coro::task<bool> TransferManager::upload_chunk(
             co_return false;
         }
 
-        if (resp_header.message_type == static_cast<uint32_t>(ChunkMessageType::Error)) {
-            Logger::instance().error("Peer returned error for upload: " + target_peer.node_id);
+        if (resp_header.message_type != static_cast<uint32_t>(ChunkMessageType::Ack)) {
+            Logger::instance().error("Peer rejected upload: " + target_peer.node_id);
+            impl_->stats.failed_uploads++;
+            co_await stream.close();
+            co_return false;
+        }
+
+        // The Ack echoes the receiver's SHA256 of what it stored; it must
+        // match our copy or the transfer was corrupted
+        uint8_t computed[32];
+        sha256_raw(data.data(), data.size(), computed);
+        if (std::memcmp(computed, resp_header.hash, 32) != 0) {
+            Logger::instance().error("Upload hash mismatch reported by peer: " + target_peer.node_id);
             impl_->stats.failed_uploads++;
             co_await stream.close();
             co_return false;
@@ -1218,8 +1066,11 @@ void TransferManager::cancel_transfer(const std::string& chunk_id) {
     std::lock_guard<std::mutex> lock(impl_->transfers_mutex);
     auto it = impl_->active_transfers.find(chunk_id);
     if (it != impl_->active_transfers.end()) {
+        // Signal all in-flight peer downloads for this chunk to abort.
+        // The download loops poll this flag between slices.
+        it->second->stop_flag->store(true, std::memory_order_relaxed);
         // Save progress before cancellation for resume
-        save_progress(chunk_id, it->second->downloaded_size);
+        save_progress(chunk_id, it->second->downloaded_size.load());
     }
 }
 

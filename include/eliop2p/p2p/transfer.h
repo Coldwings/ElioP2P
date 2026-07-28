@@ -11,10 +11,13 @@
 #include <cstdint>
 #include <unordered_map>
 #include <chrono>
+#include <atomic>
 #include <elio/elio.hpp>
 #include <elio/sync/primitives.hpp>
 
 namespace eliop2p {
+
+class ChunkManager;
 
 // Transfer modes for K-selection algorithm
 enum class TransferMode {
@@ -72,7 +75,8 @@ enum class ChunkMessageType : uint32_t {
     Request = 1,    // Request chunk from peer
     Response = 2,  // Response with chunk data
     Error = 3,     // Error response
-    Ack = 4        // Acknowledgment
+    Ack = 4,        // Acknowledgment
+    Upload = 5     // Push chunk data to peer (peer stores it)
 };
 
 // Chunk transfer message header
@@ -111,7 +115,6 @@ private:
     uint64_t available_;
     std::chrono::steady_clock::time_point last_reset_;
     mutable elio::sync::spinlock mutex_;
-    uint64_t wait_time_ms_ = 0;  // Pre-calculated wait time for co_await
 };
 
 // Connection state for P2P transfer
@@ -142,10 +145,14 @@ struct ChunkTransferContext {
     std::string chunk_id;
     std::string file_path;                     // Path to temporary file
     uint64_t total_size = 0;
-    uint64_t downloaded_size = 0;
+    std::atomic<uint64_t> downloaded_size{0};
     uint64_t last_checkpoint_size = 0;         // Last flushed position
     std::chrono::steady_clock::time_point last_checkpoint_time;
     bool is_resume = false;
+
+    // Shared stop flag: set to request cancellation of all peer downloads
+    // racing for this chunk (first successful peer wins, or explicit cancel).
+    std::shared_ptr<std::atomic<bool>> stop_flag = std::make_shared<std::atomic<bool>>(false);
 
     // Progress checkpoint: flush every 1MB
     static constexpr uint64_t CHECKPOINT_INTERVAL = 1024 * 1024;  // 1MB
@@ -214,7 +221,6 @@ public:
     bool has_progress(const std::string& chunk_id) const;
 
     // Set chunk manager for storing chunks
-    class ChunkManager;
     void set_chunk_manager(ChunkManager* manager);
 
     // Set node discovery for querying peers
@@ -234,6 +240,11 @@ public:
     // Set callback for when chunk data is needed
     using ChunkDataProvider = std::function<std::optional<std::vector<uint8_t>>(const std::string& chunk_id)>;
     void set_chunk_data_provider(ChunkDataProvider provider);
+
+    // Set callback for storing chunk data received via Upload messages.
+    // Returns true if the chunk was accepted and stored.
+    using ChunkDataConsumer = std::function<bool(const std::string& chunk_id, const std::vector<uint8_t>& data)>;
+    void set_chunk_data_consumer(ChunkDataConsumer consumer);
 
 private:
     struct Impl;
