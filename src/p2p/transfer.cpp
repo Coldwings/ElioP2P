@@ -253,8 +253,16 @@ struct TransferManager::Impl {
                     co_return;
                 }
 
+                // Verify payload integrity before storing: the sender puts
+                // SHA256(data) in the header. (This detects corruption; the
+                // trust model for accepting peer content at all is enforced
+                // at the proxy layer via origin-anchored meta hashes.)
+                uint8_t computed[32];
+                sha256_raw(data.data(), data.size(), computed);
+                const bool hash_ok = (std::memcmp(computed, header.hash, 32) == 0);
+
                 bool accepted = false;
-                if (chunk_data_consumer) {
+                if (hash_ok && chunk_data_consumer) {
                     accepted = chunk_data_consumer(chunk_id, data);
                 }
 
@@ -601,7 +609,8 @@ elio::coro::task<PeerDownloadResult> download_from_peer(
     BandwidthLimiter* download_limiter,
     std::shared_ptr<ChunkTransferContext> ctx,
     PeerNode peer,
-    TransferProgressCallback progress_callback) {
+    TransferProgressCallback progress_callback,
+    std::string expected_sha256 = "") {
 
     PeerDownloadResult result;
     const uint64_t slice_size = 256 * 1024;
@@ -750,6 +759,22 @@ elio::coro::task<PeerDownloadResult> download_from_peer(
             co_return result;
         }
 
+        // Origin-anchored content check: when the caller knows the true
+        // hash (learned from the storage origin), enforce it so a peer
+        // serving wrong bytes with a consistent self-hash still loses.
+        if (!expected_sha256.empty()) {
+            auto digest = elio::hash::sha256(result.data.data(), result.data.size());
+            const std::string hex = elio::hash::sha256_hex(digest);
+            if (hex != expected_sha256) {
+                Logger::instance().error("Origin-anchored hash mismatch for chunk " +
+                                         ctx->chunk_id + " from peer " + peer.node_id +
+                                         " (expected " + expected_sha256.substr(0, 16) + "...)");
+                result.data.clear();
+                result.bytes_downloaded = 0;
+                co_return result;
+            }
+        }
+
         Logger::instance().info("Successfully downloaded " + std::to_string(result.bytes_downloaded) +
                                " bytes from peer: " + peer.node_id);
         result.success = true;
@@ -841,7 +866,8 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_
             impl_->download_limiter.get(),
             ctx,
             peer,
-            progress_callback));
+            progress_callback,
+            request.expected_sha256));
     }
 
     bool download_success = false;
@@ -892,7 +918,8 @@ elio::coro::task<std::optional<std::vector<uint8_t>>> TransferManager::download_
                     impl_->download_limiter.get(),
                     ctx,
                     peer,
-                    progress_callback);
+                    progress_callback,
+                    request.expected_sha256);
 
                 if (r.success) {
                     ctx->stop_flag->store(true, std::memory_order_relaxed);
@@ -1006,7 +1033,8 @@ elio::coro::task<bool> TransferManager::upload_chunk(
 
         elio::net::tcp_stream& stream = *connect_result;
 
-        // Build Upload header (wire format on send)
+        // Build Upload header (wire format on send). The hash lets the
+        // receiver verify payload integrity before storing.
         ChunkMessageHeader header{};
         header.magic = CHUNK_TRANSFER_MAGIC;
         header.version = CHUNK_TRANSFER_VERSION;
@@ -1015,6 +1043,7 @@ elio::coro::task<bool> TransferManager::upload_chunk(
         header.data_length = static_cast<uint32_t>(data.size());
         header.sequence_number = 0;
         header.flags = ChunkMessageHeader::FLAG_LAST_PART;
+        sha256_raw(data.data(), data.size(), header.hash);
 
         auto wire = header_to_wire(header);
         if (!co_await write_exact(stream, &wire, sizeof(wire))) {

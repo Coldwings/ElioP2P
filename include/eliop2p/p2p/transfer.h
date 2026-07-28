@@ -36,6 +36,10 @@ struct TransferRequest {
     uint32_t k_value = 5;              // Number of parallel connections (5-10)
     bool enable_resume = true;          // Enable resume support
     PeerList sources;                    // Candidate source peers (optional, can query from node discovery)
+    // Origin-anchored content hash (hex). When set, a peer's data is only
+    // accepted if its SHA256 matches - peers serving wrong bytes lose the
+    // race even with a consistent self-reported transfer hash.
+    std::string expected_sha256;
 };
 
 // Transfer progress

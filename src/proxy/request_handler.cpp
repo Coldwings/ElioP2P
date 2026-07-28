@@ -60,10 +60,42 @@ struct RequestHandler::Impl {
     // Configuration
     uint64_t chunk_size_mb = 16;
     std::atomic<bool> enable_p2p_fallback{true};
+    std::string allowed_bucket;  // set at startup; empty = unrestricted
+
+    // Serializes read-modify-write cycles of "<key>#meta" chunks
+    std::mutex meta_mutex;
 
     Impl(std::shared_ptr<ChunkManager> cm, std::shared_ptr<StorageClient> sc)
         : cache_manager(cm), storage_client(sc) {}
 };
+
+// Meta chunk line format: "<size> <etag> [<chunk_sha256_hex> ...]"
+// The hash list grows as chunks are fetched from the origin; it is the
+// trust anchor for verifying P2P-downloaded chunk content.
+static std::string serialize_meta(const RequestHandler::ObjectInfo& obj) {
+    std::ostringstream oss;
+    oss << obj.size << " " << obj.etag;
+    for (const auto& h : obj.chunk_hashes) {
+        oss << " " << h;
+    }
+    return oss.str();
+}
+
+static std::optional<RequestHandler::ObjectInfo> parse_meta(const std::string& content) {
+    std::istringstream iss(content);
+    RequestHandler::ObjectInfo obj;
+    if (!(iss >> obj.size)) {
+        return std::nullopt;
+    }
+    if (!(iss >> obj.etag)) {
+        obj.etag.clear();
+    }
+    std::string h;
+    while (iss >> h) {
+        obj.chunk_hashes.push_back(std::move(h));
+    }
+    return obj;
+}
 
 RequestHandler::RequestHandler(std::shared_ptr<ChunkManager> cache_manager,
                                std::shared_ptr<StorageClient> storage_client)
@@ -77,6 +109,10 @@ void RequestHandler::set_transfer_manager(std::shared_ptr<TransferManager> trans
 
 void RequestHandler::set_p2p_fallback_enabled(bool enabled) {
     impl_->enable_p2p_fallback.store(enabled);
+}
+
+void RequestHandler::set_allowed_bucket(std::string bucket) {
+    impl_->allowed_bucket = std::move(bucket);
 }
 
 RequestAuthType RequestHandler::detect_auth_type(const HttpRequest& request) const {
@@ -209,6 +245,16 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
         response.status_message = "Bad Request";
         response.set_header("Content-Type", "text/plain");
         std::string msg = "Invalid request: could not parse bucket/key from path";
+        response.body.assign(msg.begin(), msg.end());
+        co_return response;
+    }
+
+    // Bucket allowlist: refuse to proxy arbitrary buckets when configured
+    if (!impl_->allowed_bucket.empty() && cache_key_info->bucket != impl_->allowed_bucket) {
+        response.status_code = 403;
+        response.status_message = "Forbidden";
+        response.set_header("Content-Type", "text/plain");
+        std::string msg = "Bucket not allowed: " + cache_key_info->bucket;
         response.body.assign(msg.begin(), msg.end());
         co_return response;
     }
@@ -389,19 +435,11 @@ RequestHandler::get_object_info(const CacheKeyInfo& info) {
     // Cached meta chunk?
     if (impl_->cache_manager) {
         if (auto meta = impl_->cache_manager->get_chunk(meta_key)) {
-            // Format: "<size> <etag>"
             std::string content(meta->data().begin(), meta->data().end());
-            auto sp = content.find(' ');
-            try {
-                ObjectInfo obj;
-                obj.size = std::stoull(content.substr(0, sp));
-                if (sp != std::string::npos) {
-                    obj.etag = content.substr(sp + 1);
-                }
-                co_return obj;
-            } catch (...) {
-                // Corrupt meta entry; fall through
+            if (auto obj = parse_meta(content)) {
+                co_return *obj;
             }
+            // Corrupt meta entry; fall through
         }
     }
 
@@ -417,20 +455,13 @@ RequestHandler::get_object_info(const CacheKeyInfo& info) {
         auto meta_data = co_await transfer_manager->download_chunk(treq);
         if (meta_data && !meta_data->empty()) {
             std::string content(meta_data->begin(), meta_data->end());
-            auto sp = content.find(' ');
-            try {
-                ObjectInfo obj;
-                obj.size = std::stoull(content.substr(0, sp));
-                if (sp != std::string::npos) {
-                    obj.etag = content.substr(sp + 1);
-                }
+            if (auto obj = parse_meta(content)) {
                 if (impl_->cache_manager) {
                     impl_->cache_manager->store_chunk(meta_key, *meta_data);
                 }
-                co_return obj;
-            } catch (...) {
-                // Not a valid meta chunk; fall through to HEAD
+                co_return *obj;
             }
+            // Not a valid meta chunk; fall through to HEAD
         }
     }
 
@@ -450,7 +481,7 @@ RequestHandler::get_object_info(const CacheKeyInfo& info) {
     // Cache the meta chunk for subsequent requests (and announce it so
     // peers can fetch object metadata over P2P as well)
     if (impl_->cache_manager) {
-        std::string content = std::to_string(obj.size) + " " + obj.etag;
+        std::string content = serialize_meta(obj);
         std::vector<uint8_t> bytes(content.begin(), content.end());
         impl_->cache_manager->store_chunk(meta_key, bytes);
         if (transfer_manager) {
@@ -487,6 +518,11 @@ RequestHandler::fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj,
         treq.expected_size = std::min(chunk_size, obj.size - offset);
         treq.k_value = 3;
         treq.mode = TransferMode::FastestFirst;
+        // Origin-anchored verification: a peer serving wrong bytes loses the
+        // race outright, so a poisoned peer cannot beat an honest one.
+        if (chunk_index < obj.chunk_hashes.size()) {
+            treq.expected_sha256 = obj.chunk_hashes[chunk_index];
+        }
 
         auto data = co_await transfer_manager->download_chunk(treq);
         if (data && !data->empty()) {
@@ -511,8 +547,37 @@ RequestHandler::fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj,
     }
 
     Logger::instance().info("Chunk from storage: " + chunk_id);
+
+    // Anchor this chunk's hash in the meta chunk: the origin is our trust
+    // root, and recording the hash here lets peers (and future P2P
+    // downloads) verify content independently of any single peer's claim.
+    const std::string chunk_hash = ChunkManager::compute_sha256(*data);
     if (impl_->cache_manager) {
         impl_->cache_manager->store_chunk(chunk_id, *data);
+
+        const std::string meta_key = info.full_object_key + "#meta";
+        {
+            std::lock_guard<std::mutex> lock(impl_->meta_mutex);
+            ObjectInfo updated = obj;
+            if (auto meta = impl_->cache_manager->get_chunk(meta_key)) {
+                std::string content(meta->data().begin(), meta->data().end());
+                if (auto cur = parse_meta(content)) {
+                    updated = *cur;
+                }
+            }
+            if (updated.chunk_hashes.size() <= chunk_index) {
+                updated.chunk_hashes.resize(chunk_index + 1);
+            }
+            if (updated.chunk_hashes[chunk_index].empty()) {
+                updated.chunk_hashes[chunk_index] = chunk_hash;
+                std::string content = serialize_meta(updated);
+                std::vector<uint8_t> bytes(content.begin(), content.end());
+                impl_->cache_manager->store_chunk(meta_key, bytes);
+                if (transfer_manager) {
+                    transfer_manager->announce_local_chunk(meta_key);
+                }
+            }
+        }
     }
     if (transfer_manager) {
         transfer_manager->announce_local_chunk(chunk_id);

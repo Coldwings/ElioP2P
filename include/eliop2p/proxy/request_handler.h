@@ -58,6 +58,10 @@ public:
     // Enable/disable P2P fallback
     void set_p2p_fallback_enabled(bool enabled);
 
+    // Restrict serving to a single bucket (empty = no restriction).
+    // Call during startup, before requests arrive.
+    void set_allowed_bucket(std::string bucket);
+
     // Handle incoming HTTP request
     // Returns response - caller is responsible for sending it
     elio::coro::task<HttpResponse> handle_request(const HttpRequest& request);
@@ -95,6 +99,10 @@ public:
     struct ObjectInfo {
         uint64_t size = 0;
         std::string etag;
+        // Per-chunk SHA256 (hex), learned progressively as chunks are
+        // fetched from the storage origin. Acts as the trust anchor for
+        // verifying P2P-downloaded chunk content.
+        std::vector<std::string> chunk_hashes;
     };
 
     // Byte range parsed from an HTTP Range header (inclusive start/end).
