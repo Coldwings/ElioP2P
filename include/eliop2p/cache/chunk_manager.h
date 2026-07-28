@@ -34,8 +34,9 @@ public:
     ChunkManager(const CacheConfig& config);
     ~ChunkManager();
 
-    // Get chunk data - checks memory cache first, then disk
-    std::optional<Chunk> get_chunk(const std::string& chunk_id);
+    // Get chunk data - checks memory cache first, then disk.
+    // Zero-copy on hit: returns a shared handle to the cached chunk.
+    std::shared_ptr<const Chunk> get_chunk(const std::string& chunk_id);
 
     // Store chunk data
     bool store_chunk(const std::string& chunk_id, const std::vector<uint8_t>& data);

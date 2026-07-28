@@ -162,7 +162,7 @@ TEST_CASE("E2E_SystemLifecycle - Complete startup and shutdown", "[e2e][lifecycl
 
     // Verify data preserved after shutdown
     auto retrieved = cache->get_chunk("lifecycle_test");
-    REQUIRE(retrieved.has_value() == true);
+    REQUIRE(retrieved != nullptr);
 
     INFO("E2E system lifecycle test completed");
 }
@@ -196,7 +196,7 @@ TEST_CASE("E2E_HighLoadScenario - Concurrent request handling", "[e2e][load][con
                 std::string key = "load_test_" + std::to_string((t * 20 + i) % 50);
                 if (cache->has_chunk(key)) {
                     auto data = cache->get_chunk(key);
-                    if (data.has_value()) {
+                    if (data != nullptr) {
                         success_count++;
                     } else {
                         fail_count++;
@@ -243,7 +243,7 @@ TEST_CASE("E2E_DataConsistency - Data integrity verification", "[e2e][consistenc
 
     // Retrieve and verify
     auto retrieved = cache->get_chunk(key);
-    REQUIRE(retrieved.has_value() == true);
+    REQUIRE(retrieved != nullptr);
     REQUIRE(retrieved->data() == original_data);
 
     // Verify integrity check
@@ -256,7 +256,7 @@ TEST_CASE("E2E_DataConsistency - Data integrity verification", "[e2e][consistenc
     // Re-store and verify again
     REQUIRE(cache->store_chunk(key, original_data) == true);
     auto re_retrieved = cache->get_chunk(key);
-    REQUIRE(re_retrieved.has_value() == true);
+    REQUIRE(re_retrieved != nullptr);
     REQUIRE(re_retrieved->data() == original_data);
 
     INFO("E2E data consistency test completed");

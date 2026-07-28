@@ -52,7 +52,7 @@ TEST_CASE("CacheAndStorageIntegration - Cache miss loads from storage", "[integr
 
     // Now should be able to get from cache
     auto retrieved = cache_manager.get_chunk(chunk_id);
-    REQUIRE(retrieved.has_value() == true);
+    REQUIRE(retrieved != nullptr);
     REQUIRE(retrieved->data() == data_from_storage);
 }
 
@@ -337,7 +337,7 @@ TEST_CASE("ChunkReplicationIntegration - Chunks replicate to multiple peers", "[
 
     // Verify data integrity
     auto retrieved = source_cache->get_chunk("replicate_chunk");
-    REQUIRE(retrieved.has_value() == true);
+    REQUIRE(retrieved != nullptr);
     REQUIRE(retrieved->data() == replicate_data);
 
     // Setup destination cache
@@ -348,7 +348,7 @@ TEST_CASE("ChunkReplicationIntegration - Chunks replicate to multiple peers", "[
 
     // Verify replica
     auto replica = dest_cache->get_chunk("replicate_chunk");
-    REQUIRE(replica.has_value() == true);
+    REQUIRE(replica != nullptr);
     REQUIRE(replica->data() == replicate_data);
 }
 
@@ -426,7 +426,7 @@ TEST_CASE("GracefulShutdownIntegration - All modules shutdown gracefully", "[int
 
     // Verify cache data still accessible after shutdown
     auto retrieved = cache_manager->get_chunk("shutdown_test");
-    REQUIRE(retrieved.has_value() == true);
+    REQUIRE(retrieved != nullptr);
 
     REQUIRE(true);  // Reached here = clean shutdown
 }

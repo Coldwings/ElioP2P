@@ -17,7 +17,7 @@ TEST_CASE("LRU Cache Basic Operations", "[cache][lru]") {
     REQUIRE(cache.exists("key1") == true);
 
     auto result = cache.get("key1");
-    REQUIRE(result.has_value() == true);
+    REQUIRE(result != nullptr);
     REQUIRE(result->data() == data1);
 
     // Test eviction
@@ -81,7 +81,7 @@ TEST_CASE("ChunkManager Basic Operations", "[cache][chunk]") {
 
     // Test chunk retrieval
     auto retrieved = manager.get_chunk(chunk_id);
-    REQUIRE(retrieved.has_value() == true);
+    REQUIRE(retrieved != nullptr);
     REQUIRE(retrieved->data() == chunk_data);
 
     // Test chunk existence

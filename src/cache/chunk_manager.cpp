@@ -163,7 +163,7 @@ ChunkManager::ChunkManager(const CacheConfig& config)
 
 ChunkManager::~ChunkManager() = default;
 
-std::optional<Chunk> ChunkManager::get_chunk(const std::string& chunk_id) {
+std::shared_ptr<const Chunk> ChunkManager::get_chunk(const std::string& chunk_id) {
     // Fast path: shared lock, memory hit
     {
         std::shared_lock<std::shared_mutex> lock(impl_->cache_mutex_);
@@ -185,19 +185,19 @@ std::optional<Chunk> ChunkManager::get_chunk(const std::string& chunk_id) {
 
     if (impl_->disk_index_.find(chunk_id) == impl_->disk_index_.end()) {
         Logger::instance().debug("Chunk not found in any cache: " + chunk_id);
-        return std::nullopt;
+        return nullptr;
     }
 
     auto data = impl_->load_from_disk_internal(chunk_id);
     if (!data) {
         // Index said it exists but the file is gone/unreadable; drop the entry
         impl_->disk_index_.erase(chunk_id);
-        return std::nullopt;
+        return nullptr;
     }
 
     Logger::instance().debug("Chunk loaded from disk, promoting to memory: " + chunk_id);
     impl_->memory_cache->put(chunk_id, *data);
-    return Chunk(chunk_id, *data);
+    return impl_->memory_cache->get(chunk_id);
 }
 
 bool ChunkManager::store_chunk(const std::string& chunk_id, const std::vector<uint8_t>& data) {

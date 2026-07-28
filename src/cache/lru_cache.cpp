@@ -77,7 +77,7 @@ struct LRUCache::Impl {
 
     // LRU list: most recently used at front
     std::list<std::string> lru_list_;
-    std::unordered_map<std::string, Chunk> cache_;
+    std::unordered_map<std::string, std::shared_ptr<Chunk>> cache_;
     std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
 
     EvictionCallback eviction_callback;
@@ -127,11 +127,11 @@ struct LRUCache::Impl {
             if (chunk_it == cache_.end()) continue;
 
             // Skip items in protection period
-            if (now - chunk_it->second.last_access_time() < eviction_protection_sec_) {
+            if (now - chunk_it->second->last_access_time() < eviction_protection_sec_) {
                 continue;
             }
 
-            float score = chunk_it->second.compute_eviction_score(
+            float score = chunk_it->second->compute_eviction_score(
                 now,
                 eviction_weight_time_,
                 eviction_weight_replica_,
@@ -165,9 +165,9 @@ struct LRUCache::Impl {
 
         auto it = cache_.find(key);
         if (it != cache_.end()) {
-            current_size_ -= it->second.size();
+            current_size_ -= it->second->size();
             if (eviction_callback) {
-                eviction_callback(key, it->second.data());
+                eviction_callback(key, it->second->data());
             }
             cache_.erase(it);
             stats_.evictions++;
@@ -182,8 +182,8 @@ struct LRUCache::Impl {
 
         for (const auto& pair : cache_) {
             // compute_heat_level is const and only touches mutable members
-            pair.second.compute_heat_level(now, hot_threshold_, warm_threshold_);
-            switch (pair.second.heat_level()) {
+            pair.second->compute_heat_level(now, hot_threshold_, warm_threshold_);
+            switch (pair.second->heat_level()) {
                 case HeatLevel::Hot: stats_.hot_items++; break;
                 case HeatLevel::Warm: stats_.warm_items++; break;
                 case HeatLevel::Cold: stats_.cold_items++; break;
@@ -209,13 +209,13 @@ LRUCache::~LRUCache() = default;
 LRUCache::LRUCache(LRUCache&& other) noexcept = default;
 LRUCache& LRUCache::operator=(LRUCache&& other) noexcept = default;
 
-std::optional<Chunk> LRUCache::get(const std::string& key) {
+std::shared_ptr<const Chunk> LRUCache::get(const std::string& key) {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
 
     auto it = impl_->cache_.find(key);
     if (it == impl_->cache_.end()) {
         impl_->stats_.misses++;
-        return std::nullopt;
+        return nullptr;
     }
 
     impl_->touch(key);
@@ -223,11 +223,11 @@ std::optional<Chunk> LRUCache::get(const std::string& key) {
 
     // Update access time and count
     uint64_t now = impl_->current_time();
-    it->second.set_last_access_time(now);
-    it->second.increment_access_count();
+    it->second->set_last_access_time(now);
+    it->second->increment_access_count();
 
     // Recompute heat level
-    it->second.compute_heat_level(now, impl_->hot_threshold_, impl_->warm_threshold_);
+    it->second->compute_heat_level(now, impl_->hot_threshold_, impl_->warm_threshold_);
 
     return it->second;
 }
@@ -248,8 +248,8 @@ bool LRUCache::put(const std::string& key, const std::vector<uint8_t>& data) {
     auto it = impl_->cache_.find(key);
     if (it != impl_->cache_.end()) {
         // Update existing
-        impl_->current_size_ -= it->second.size();
-        it->second = Chunk(key, data);
+        impl_->current_size_ -= it->second->size();
+        it->second = std::make_shared<Chunk>(key, data);
         impl_->current_size_ += data.size();
         impl_->touch(key);
         return true;
@@ -262,7 +262,7 @@ bool LRUCache::put(const std::string& key, const std::vector<uint8_t>& data) {
     }
 
     // Insert new
-    impl_->cache_[key] = Chunk(key, data);
+    impl_->cache_[key] = std::make_shared<Chunk>(key, data);
     impl_->lru_list_.push_front(key);
     impl_->lru_map_[key] = impl_->lru_list_.begin();
     impl_->current_size_ += data.size();
@@ -271,7 +271,7 @@ bool LRUCache::put(const std::string& key, const std::vector<uint8_t>& data) {
 
     // Initial heat level
     uint64_t now = impl_->current_time();
-    impl_->cache_[key].compute_heat_level(now, impl_->hot_threshold_, impl_->warm_threshold_);
+    impl_->cache_[key]->compute_heat_level(now, impl_->hot_threshold_, impl_->warm_threshold_);
 
     // Trigger eviction check after putting new data
     maybe_evict();
@@ -287,9 +287,9 @@ bool LRUCache::remove(const std::string& key) {
         return false;
     }
 
-    impl_->current_size_ -= it->second.size();
+    impl_->current_size_ -= it->second->size();
     impl_->stats_.total_items--;
-    impl_->stats_.total_bytes -= it->second.size();
+    impl_->stats_.total_bytes -= it->second->size();
 
     auto lru_it = impl_->lru_map_.find(key);
     if (lru_it != impl_->lru_map_.end()) {
@@ -368,8 +368,8 @@ void LRUCache::update_chunk_metadata(const std::string& key,
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     auto it = impl_->cache_.find(key);
     if (it != impl_->cache_.end()) {
-        it->second.set_replica_count(replica_count);
-        it->second.set_heat_level(heat_level);
+        it->second->set_replica_count(replica_count);
+        it->second->set_heat_level(heat_level);
     }
 }
 

@@ -102,7 +102,10 @@ public:
     LRUCache(LRUCache&& other) noexcept;
     LRUCache& operator=(LRUCache&& other) noexcept;
 
-    std::optional<Chunk> get(const std::string& key);
+    // Returns a shared handle to the cached chunk (nullptr on miss).
+    // Hot-path hits are zero-copy: callers hold a const reference to the
+    // chunk living in the cache instead of a full data copy.
+    std::shared_ptr<const Chunk> get(const std::string& key);
     bool put(const std::string& key, const std::vector<uint8_t>& data);
     bool remove(const std::string& key);
     bool exists(const std::string& key) const;
