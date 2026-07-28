@@ -46,3 +46,14 @@ if(ENABLE_TESTING)
 
     message(STATUS "Testing enabled with Catch2")
 endif()
+
+    # Manual E2E: two-node P2P cluster against a real MinIO backend.
+    # Not registered with ctest - run explicitly: ./bin/e2e_p2p_cluster
+    add_executable(e2e_p2p_cluster e2e_p2p_cluster.cpp)
+    target_link_libraries(e2e_p2p_cluster PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto)
+
+    add_executable(sig_probe sig_probe.cpp)
+    target_link_libraries(sig_probe PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto)
+
+    add_executable(head_probe head_probe.cpp)
+    target_link_libraries(head_probe PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto)
