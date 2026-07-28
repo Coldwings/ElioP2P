@@ -2,25 +2,27 @@
 #include "eliop2p/base/logger.h"
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <ctime>
 #include <map>
 
 namespace eliop2p {
 
-// OSS-specific SHA1 for signature (OSS uses HMAC-SHA1)
-static std::string hmac_sha1(const std::string& key, const std::string& data) {
+// OSS-specific HMAC-SHA1 for signature. Per the OSS spec the Signature is
+// Base64(HMAC-SHA1(AccessKeySecret, StringToSign)), not hex.
+static std::string hmac_sha1_base64(const std::string& key, const std::string& data) {
     unsigned char hash[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
     HMAC(EVP_sha1(), key.data(), key.size(),
          reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash, &len);
 
-    std::ostringstream oss;
-    for (unsigned int i = 0; i < len; ++i) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
-    }
-    return oss.str();
+    std::string out(4 * ((len + 2) / 3), '\0');
+    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), hash,
+                    static_cast<int>(len));
+    return out;
 }
 
 // Get current UTC time in RFC 7231 format for OSS
@@ -114,16 +116,24 @@ std::string OSSClient::generate_presigned_url_internal_oss(
         endpoint = endpoint.substr(0, colon_pos);
     }
 
-    std::string expires = std::to_string(expires_in_seconds);
-    std::string date = get_current_time_oss();
+    // OSS presigned URLs carry an absolute expiry: Expires is a Unix
+    // timestamp (seconds since epoch), NOT a validity duration. Writing the
+    // raw expires_in seconds here would produce an URL that is already
+    // expired at generation time.
+    std::string expires = std::to_string(
+        static_cast<uint64_t>(std::time(nullptr)) + expires_in_seconds);
 
-    // Build string to sign (OSS style)
+    // Build string to sign (OSS style):
+    //   VERB "\n" Content-MD5 "\n" Content-Type "\n" Expires "\n"
+    //   CanonicalizedOSSHeaders CanonicalizedResource
+    // No x-oss- headers are sent with a plain presigned GET, so
+    // CanonicalizedOSSHeaders is empty; CanonicalizedResource is /bucket/key.
     std::ostringstream string_to_sign;
     string_to_sign << "GET\n\n\n";
     string_to_sign << expires << "\n";
     string_to_sign << "/" << bucket << "/" << key;
 
-    std::string signature = hmac_sha1(secret_key, string_to_sign.str());
+    std::string signature = hmac_sha1_base64(secret_key, string_to_sign.str());
 
     // Build final URL
     std::string protocol = config.use_https ? "https://" : "http://";
@@ -137,8 +147,8 @@ std::string OSSClient::generate_presigned_url_internal_oss(
 
 std::vector<std::pair<std::string, std::string>> OSSClient::sign_request_oss(
     const std::string& method,
-    const std::string& /*bucket*/,
-    const std::string& /*key*/,
+    const std::string& bucket,
+    const std::string& key,
     const std::string& /*query_string*/,
     const std::vector<std::pair<std::string, std::string>>& headers,
     const std::string& /*payload_hash*/) {
@@ -154,31 +164,43 @@ std::vector<std::pair<std::string, std::string>> OSSClient::sign_request_oss(
 
     std::string date = get_current_time_oss();
 
-    // Build canonical string for OSS
-    std::ostringstream canonical_string;
-    canonical_string << method << "\n";
-    canonical_string << "\n";  // Content-MD5 (empty)
-    canonical_string << "\n";  // Content-Type (empty)
-    canonical_string << date << "\n";
-
-    // Add OSS-specific headers
+    // Pull Content-MD5 / Content-Type out of the request headers; both take
+    // part in the OSS string-to-sign.
+    std::string content_md5;
+    std::string content_type;
     std::map<std::string, std::string> oss_headers;
     for (const auto& h : headers) {
         std::string lower_key;
         for (char c : h.first) {
-            lower_key += static_cast<char>(std::tolower(c));
+            lower_key += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-        if (lower_key.substr(0, 4) == "x-oss") {
+        if (lower_key == "content-md5") {
+            content_md5 = h.second;
+        } else if (lower_key == "content-type") {
+            content_type = h.second;
+        } else if (lower_key.substr(0, 6) == "x-oss-") {
             oss_headers[lower_key] = h.second;
         }
     }
 
-    // Add OSS headers in sorted order
+    // Build canonical string for OSS:
+    //   VERB "\n" Content-MD5 "\n" Content-Type "\n" Date "\n"
+    //   CanonicalizedOSSHeaders CanonicalizedResource
+    std::ostringstream canonical_string;
+    canonical_string << method << "\n";
+    canonical_string << content_md5 << "\n";
+    canonical_string << content_type << "\n";
+    canonical_string << date << "\n";
+
+    // CanonicalizedOSSHeaders: x-oss-* headers in lexicographical order
     for (const auto& h : oss_headers) {
         canonical_string << h.first << ":" << h.second << "\n";
     }
 
-    std::string signature = hmac_sha1(secret_key, canonical_string.str());
+    // CanonicalizedResource: /bucket/key
+    canonical_string << "/" << bucket << "/" << key;
+
+    std::string signature = hmac_sha1_base64(secret_key, canonical_string.str());
 
     return {
         {"Date", date},

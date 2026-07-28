@@ -191,7 +191,12 @@ public:
     // Set auth type
     void set_auth_type(AuthType type) { auth_type_ = type; }
 
-    // Set scheduler for async HTTP operations
+    // Set scheduler for async HTTP operations.
+    // NOTE: elio::http::client does not accept an external scheduler (neither
+    // via constructor nor a setter); it always uses the ambient
+    // elio::runtime::scheduler::current() of the running coroutine. This
+    // setter is therefore a no-op kept only for StorageClient interface
+    // compatibility.
     void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler);
 
     // Process incoming request and forward to storage with auth
@@ -250,7 +255,9 @@ private:
     AuthType auth_type_ = AuthType::None;
     std::string access_key_;
     std::string secret_key_;
-    std::shared_ptr<elio::runtime::scheduler> scheduler_;
+    // No scheduler_ member: elio::http::client uses
+    // elio::runtime::scheduler::current() internally and cannot be given an
+    // external scheduler, so storing one here would be dead code.
 };
 
 // Storage client factory - auto-detects backend based on endpoint

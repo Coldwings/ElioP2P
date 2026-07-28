@@ -7,6 +7,8 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <map>
+#include <cctype>
 
 namespace eliop2p {
 
@@ -40,16 +42,14 @@ static std::string hmac_sha256(const std::string& key, const std::string& data) 
     return oss.str();
 }
 
-// Get current UTC time in ISO 8601 format
+// Get current UTC time in ISO 8601 basic format required by AWS SigV4
+// (YYYYMMDDTHHMMSSZ, no fractional seconds).
 static std::string get_current_time_iso() {
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()) % 1000;
 
     std::ostringstream oss;
-    oss << std::put_time(std::gmtime(&time_t), "%Y%m%dT%H%M%S");
-    oss << '.' << std::setfill('0') << std::setw(3) << ms.count() << "Z";
+    oss << std::put_time(std::gmtime(&time_t), "%Y%m%dT%H%M%SZ");
     return oss.str();
 }
 
@@ -73,6 +73,88 @@ static std::string url_encode_path(const std::string& value) {
         }
     }
     return oss.str();
+}
+
+// URL encode for SigV4 query parameter names/values (RFC 3986 unreserved
+// characters only; unlike path encoding, '/' is percent-encoded).
+static std::string url_encode_query(const std::string& value) {
+    std::ostringstream oss;
+    for (unsigned char c : value) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            oss << c;
+        } else {
+            oss << '%' << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+        }
+    }
+    return oss.str();
+}
+
+// Trim leading/trailing whitespace and collapse internal runs of whitespace
+// into a single space, as required for SigV4 canonical header values.
+static std::string trim_and_compress(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    bool pending_space = false;
+    bool seen_any = false;
+    for (unsigned char c : value) {
+        if (std::isspace(c)) {
+            if (seen_any) pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            out += ' ';
+            pending_space = false;
+        }
+        out += static_cast<char>(c);
+        seen_any = true;
+    }
+    return out;
+}
+
+// Build a SigV4 canonical query string from a raw "a=1&b=2" style string:
+// parameters are URI-encoded and sorted by encoded name.
+static std::string canonicalize_query_string(const std::string& query) {
+    std::map<std::string, std::string> params;  // encoded name -> encoded value
+    std::istringstream iss(query);
+    std::string pair;
+    while (std::getline(iss, pair, '&')) {
+        if (pair.empty()) continue;
+        size_t eq = pair.find('=');
+        std::string name = (eq == std::string::npos) ? pair : pair.substr(0, eq);
+        std::string value = (eq == std::string::npos) ? "" : pair.substr(eq + 1);
+        params[url_encode_query(name)] = url_encode_query(value);
+    }
+    std::ostringstream oss;
+    bool first = true;
+    for (const auto& [name, value] : params) {
+        if (!first) oss << '&';
+        first = false;
+        oss << name << '=' << value;
+    }
+    return oss.str();
+}
+
+// Decode the standard XML predefined entities in a parsed value.
+static std::string xml_unescape(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (size_t i = 0; i < value.size();) {
+        if (value[i] == '&') {
+            size_t semi = value.find(';', i + 1);
+            if (semi != std::string::npos && semi - i <= 6) {
+                std::string entity = value.substr(i, semi - i + 1);
+                if (entity == "&amp;")       { out += '&';  i = semi + 1; continue; }
+                if (entity == "&lt;")        { out += '<';  i = semi + 1; continue; }
+                if (entity == "&gt;")        { out += '>';  i = semi + 1; continue; }
+                if (entity == "&quot;")      { out += '"';  i = semi + 1; continue; }
+                if (entity == "&#39;" ||
+                    entity == "&apos;")      { out += '\''; i = semi + 1; continue; }
+            }
+        }
+        out += value[i];
+        ++i;
+    }
+    return out;
 }
 
 // Parse endpoint to get host and port
@@ -164,36 +246,64 @@ std::vector<std::pair<std::string, std::string>> S3Client::sign_request(
     // Parse endpoint to get host
     auto [host, port] = parse_endpoint(config_.endpoint, config_.use_https);
     std::string region = config_.region.empty() ? "us-east-1" : config_.region;
-    std::string service = "s3";
+    const std::string service = "s3";
     std::string amz_date = get_current_time_iso();
     std::string date_stamp = get_current_date();
 
-    // Build canonical headers string
-    std::ostringstream canonical_headers;
-    canonical_headers << "host:" << host << "\n";
-    if (port != 80 && port != 443) {
-        canonical_headers << "host:" << host << ":" << port << "\n";
+    // The Host header carries the port only when it is not the default for
+    // the scheme, and it appears exactly once in the canonical headers while
+    // SignedHeaders lists it as plain "host".
+    const bool default_port =
+        (config_.use_https && port == 443) || (!config_.use_https && port == 80);
+    std::string host_header = host;
+    if (!default_port) {
+        host_header += ":" + std::to_string(port);
     }
-    canonical_headers << "x-amz-content-sha256:" << payload_hash << "\n";
-    canonical_headers << "x-amz-date:" << amz_date << "\n";
 
-    // Add any provided headers
+    // Collect canonical headers keyed by lowercase header name. std::map
+    // keeps them sorted by name as SigV4 requires; values are trimmed and
+    // internal whitespace runs are collapsed to a single space.
+    std::map<std::string, std::string> canonical_map;
+    canonical_map["host"] = host_header;
+    canonical_map["x-amz-content-sha256"] = payload_hash;
+    canonical_map["x-amz-date"] = amz_date;
     for (const auto& h : headers) {
         std::string lower_key;
         for (char c : h.first) {
-            lower_key += static_cast<char>(std::tolower(c));
+            lower_key += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-        if (lower_key != "host" && lower_key != "x-amz-content-sha256" && lower_key != "x-amz-date") {
-            canonical_headers << lower_key << ":" << h.second << "\n";
-        }
+        canonical_map[lower_key] = trim_and_compress(h.second);
     }
 
-    std::string signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    std::ostringstream canonical_headers;
+    std::ostringstream signed_headers_ss;
+    bool first = true;
+    for (const auto& [name, value] : canonical_map) {
+        canonical_headers << name << ":" << value << "\n";
+        if (!first) signed_headers_ss << ";";
+        first = false;
+        signed_headers_ss << name;
+    }
+    // SignedHeaders is generated from the exact set of canonical headers,
+    // never hardcoded, so the two can never drift apart.
+    const std::string signed_headers = signed_headers_ss.str();
+
+    // Canonical URI: service root for bucket-less requests, otherwise
+    // path-style /bucket/key with the key URI-encoded per SigV4 rules.
+    std::string canonical_uri;
+    if (bucket.empty()) {
+        canonical_uri = "/";
+    } else {
+        canonical_uri = "/" + bucket + "/";
+        if (!key.empty()) {
+            canonical_uri += url_encode_path(key);
+        }
+    }
 
     // Build canonical request
     std::ostringstream canonical_request;
     canonical_request << method << "\n";
-    canonical_request << "/" << bucket << "/" << url_encode_path(key) << "\n";
+    canonical_request << canonical_uri << "\n";
     canonical_request << query_string << "\n";
     canonical_request << canonical_headers.str() << "\n";
     canonical_request << signed_headers << "\n";
@@ -247,15 +357,13 @@ std::string S3Client::generate_presigned_url_internal(
     std::string amz_date = get_current_time_iso();
     std::string date_stamp = get_current_date();
 
-    // Calculate expiry seconds
-    std::string expires = std::to_string(expires_in_seconds);
-
-    // Build canonical query string
+    // SigV4 presigned URL query parameters (raw values; they are URI-encoded
+    // when the canonical query string is emitted).
     std::map<std::string, std::string> query_params_map;
     query_params_map["X-Amz-Algorithm"] = "AWS4-HMAC-SHA256";
     query_params_map["X-Amz-Credential"] = impl_->access_key + "/" + date_stamp + "/" + region + "/s3/aws4_request";
     query_params_map["X-Amz-Date"] = amz_date;
-    query_params_map["X-Amz-Expires"] = expires;
+    query_params_map["X-Amz-Expires"] = std::to_string(expires_in_seconds);
     query_params_map["X-Amz-SignedHeaders"] = "host";
 
     // Add any additional query params
@@ -270,25 +378,33 @@ std::string S3Client::generate_presigned_url_internal(
         }
     }
 
-    // Build canonical query string (sorted)
+    // Build canonical query string: parameters sorted by name, names and
+    // values URI-encoded per RFC 3986 (unreserved characters only).
     std::ostringstream canonical_querystring;
     bool first = true;
     for (const auto& p : query_params_map) {
         if (!first) canonical_querystring << "&";
         first = false;
-        canonical_querystring << url_encode_path(p.first) << "=" << url_encode_path(p.second);
+        canonical_querystring << url_encode_query(p.first) << "=" << url_encode_query(p.second);
+    }
+
+    // Canonical headers for a presigned URL contain only the host header
+    // (with the port when it is not the scheme default).
+    const bool default_port =
+        (config_.use_https && port == 443) || (!config_.use_https && port == 80);
+    std::string host_header = host;
+    if (!default_port) {
+        host_header += ":" + std::to_string(port);
     }
 
     // Build canonical request
     std::ostringstream canonical_request;
     canonical_request << "GET\n";
-    canonical_request << "/" << bucket + "/" + url_encode_path(key) << "\n";
+    canonical_request << "/" << bucket << "/" << url_encode_path(key) << "\n";
     canonical_request << canonical_querystring.str() << "\n";
-    canonical_request << "host:" << host << "\n";
-    canonical_request << "x-amz-content-sha256:UNSIGNED-PAYLOAD\n";
-    canonical_request << "x-amz-date:" << amz_date << "\n";
+    canonical_request << "host:" << host_header << "\n";
     canonical_request << "\n";
-    canonical_request << "host;x-amz-content-sha256;x-amz-date\n";
+    canonical_request << "host\n";
     canonical_request << "UNSIGNED-PAYLOAD";
 
     std::string canonical_request_hash = sha256_hex(canonical_request.str());
@@ -310,11 +426,8 @@ std::string S3Client::generate_presigned_url_internal(
 
     // Build final URL
     std::string protocol = config_.use_https ? "https://" : "http://";
-    std::string url = protocol + host;
-    if ((config_.use_https && port != 443) || (!config_.use_https && port != 80)) {
-        url += ":" + std::to_string(port);
-    }
-    url += "/" + bucket + "/" + key + "?" + canonical_querystring.str() + "&X-Amz-Signature=" + signature;
+    std::string url = protocol + host_header;
+    url += "/" + bucket + "/" + url_encode_path(key) + "?" + canonical_querystring.str() + "&X-Amz-Signature=" + signature;
 
     return url;
 }
@@ -403,6 +516,10 @@ elio::coro::task<std::optional<std::vector<std::string>>> S3Client::list_buckets
     std::vector<std::pair<std::string, std::string>> signed_headers;
     if (!impl_->access_key.empty() && !impl_->secret_key.empty()) {
         signed_headers = sign_request("GET", "", "", "", {}, payload_hash);
+    } else {
+        Logger::instance().warning(
+            "No storage credentials configured; sending unsigned list_buckets "
+            "request (only works for public buckets / anonymous access)");
     }
 
     elio::http::client http_client;
@@ -463,17 +580,19 @@ elio::coro::task<std::optional<ListObjectsResult>> S3Client::list_objects(
 
     Logger::instance().info("Listing objects in bucket: " + bucket);
 
-    // Build query string
+    // Build query string with raw values; execute_request canonicalizes
+    // (sorts and URI-encodes) it before signing and sending so the wire
+    // format always matches the signature.
     std::ostringstream query;
     query << "list-type=2";
     if (!prefix.empty()) {
-        query << "&prefix=" << url_encode_path(prefix);
+        query << "&prefix=" << prefix;
     }
     if (max_keys > 0) {
         query << "&max-keys=" << max_keys;
     }
     if (!continuation_token.empty()) {
-        query << "&continuation-token=" << url_encode_path(continuation_token);
+        query << "&continuation-token=" << continuation_token;
     }
 
     auto response = co_await execute_request(
@@ -690,18 +809,20 @@ elio::coro::task<bool> S3Client::bucket_exists(const std::string& bucket) {
         co_return false;
     }
 
-    // Check status code - 200 OK means bucket exists
+    // Only 200 OK proves the bucket exists and is accessible.
     auto status = response->status_code();
-    if (status == 200 || status == 403) {
-        // 200 = bucket exists, 403 = bucket exists but access denied
+    if (status == 200) {
         co_return true;
-    } else if (status == 404 || status == 425) {
-        // 404 = bucket doesn't exist, 425 = bucket name is invalid or taken
+    }
+    if (status == 404) {
         co_return false;
     }
 
-    // For other errors, assume bucket exists but there was an error
-    co_return true;
+    // Any other status (403, 5xx, ...) means we could not confirm the bucket;
+    // treat as "not existing" instead of silently claiming success.
+    Logger::instance().error("bucket_exists check for '" + bucket +
+                             "' failed with status: " + std::to_string(status));
+    co_return false;
 }
 
 // Storage client factory implementation
@@ -754,7 +875,11 @@ std::unique_ptr<StorageClient> StorageClientFactory::create(const StorageConfig&
 }
 
 void S3Client::set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) {
-    scheduler_ = std::move(scheduler);
+    // No-op: elio::http::client always uses the ambient
+    // elio::runtime::scheduler::current() of the calling coroutine and offers
+    // no way to inject an external scheduler. Kept for interface
+    // compatibility only.
+    (void)scheduler;
 }
 
 // Helper to execute HTTP request with S3 signing
@@ -770,7 +895,8 @@ elio::coro::task<std::optional<elio::http::response>> S3Client::execute_request(
     // Build URL
     std::string url = build_object_url(bucket, key, true);
 
-    // Calculate payload hash
+    // Calculate payload hash (empty-body SHA256 for GET/HEAD and other
+    // bodyless requests, per SigV4).
     std::string payload_hash;
     if (body.empty()) {
         payload_hash = sha256_hex("");
@@ -778,16 +904,21 @@ elio::coro::task<std::optional<elio::http::response>> S3Client::execute_request(
         payload_hash = sha256_hex(body);
     }
 
-    // Sign request
+    // Canonicalize the query string once and use the identical form both on
+    // the wire and inside the signature.
+    const std::string canonical_query = canonicalize_query_string(query_string);
+
+    // Sign request. Without credentials we deliberately fall back to an
+    // unsigned request so public buckets and anonymous MinIO access keep
+    // working; make the downgrade visible in the log.
     std::vector<std::pair<std::string, std::string>> signed_headers;
     if (!impl_->access_key.empty() && !impl_->secret_key.empty()) {
-        signed_headers = sign_request(method, bucket, key, query_string, extra_headers, payload_hash);
-    }
-
-    // Create HTTP client if we have a scheduler
-    if (!scheduler_) {
-        Logger::instance().error("No scheduler available for HTTP client");
-        co_return std::nullopt;
+        signed_headers = sign_request(method, bucket, key, canonical_query, extra_headers, payload_hash);
+    } else {
+        Logger::instance().warning(
+            "No storage credentials configured; sending unsigned " + method +
+            " request for " + bucket + "/" + key +
+            " (only works for public buckets / anonymous access)");
     }
 
     elio::http::client http_client;
@@ -796,8 +927,8 @@ elio::coro::task<std::optional<elio::http::response>> S3Client::execute_request(
     elio::http::request req(elio::http::string_to_method(method).value_or(elio::http::method::GET), "/" + bucket + "/" + url_encode_path(key));
 
     // Add query string if present
-    if (!query_string.empty()) {
-        req.set_query(query_string);
+    if (!canonical_query.empty()) {
+        req.set_query(canonical_query);
     }
 
     // Set host header
@@ -836,6 +967,19 @@ elio::coro::task<std::optional<elio::http::response>> S3Client::execute_request(
     co_return response;
 }
 
+// Extract the (entity-decoded) text of the first <tag>...</tag> inside the
+// given segment. Returns empty string when the tag is absent.
+static std::string xml_extract_tag(const std::string& segment, const char* tag) {
+    std::string open = std::string("<") + tag + ">";
+    std::string close = std::string("</") + tag + ">";
+    size_t start = segment.find(open);
+    if (start == std::string::npos) return "";
+    start += open.size();
+    size_t end = segment.find(close, start);
+    if (end == std::string::npos) return "";
+    return xml_unescape(segment.substr(start, end - start));
+}
+
 // Parse ListObjects XML response
 static std::optional<ListObjectsResult> parse_list_objects_response(const std::string& body) {
     ListObjectsResult result;
@@ -852,57 +996,56 @@ static std::optional<ListObjectsResult> parse_list_objects_response(const std::s
         size_t start = next_token_pos + 25;
         size_t end = body.find("</NextContinuationToken>", start);
         if (end != std::string::npos) {
-            result.continuation_token = body.substr(start, end - start);
+            result.continuation_token = xml_unescape(body.substr(start, end - start));
         }
     }
 
-    // Parse contents - look for <Key> tags
+    // Parse one object per <Contents>...</Contents> segment so that fields
+    // of different objects can never be mixed up.
     size_t pos = 0;
     while (true) {
-        size_t key_start = body.find("<Key>", pos);
-        if (key_start == std::string::npos) break;
-        size_t key_end = body.find("</Key>", key_start);
-        if (key_end == std::string::npos) break;
+        size_t seg_start = body.find("<Contents>", pos);
+        if (seg_start == std::string::npos) break;
+        size_t seg_end = body.find("</Contents>", seg_start);
+        if (seg_end == std::string::npos) break;
 
-        std::string key = body.substr(key_start + 5, key_end - key_start - 5);
+        std::string segment = body.substr(seg_start, seg_end - seg_start);
+
         ObjectMetadata obj;
-        obj.key = key;
-
-        // Look for ETag
-        size_t etag_start = body.find("<ETag>", key_end);
-        if (etag_start != std::string::npos && etag_start < key_end + 100) {
-            size_t etag_end = body.find("</ETag>", etag_start);
-            if (etag_end != std::string::npos) {
-                obj.etag = body.substr(etag_start + 6, etag_end - etag_start - 6);
-            }
+        obj.key = xml_extract_tag(segment, "Key");
+        obj.etag = xml_extract_tag(segment, "ETag");
+        obj.size = 0;
+        std::string size_str = xml_extract_tag(segment, "Size");
+        if (!size_str.empty()) {
+            try {
+                obj.size = std::stoull(size_str);
+            } catch (...) {}
+        }
+        std::string last_modified = xml_extract_tag(segment, "LastModified");
+        if (!last_modified.empty()) {
+            obj.last_modified = last_modified;
         }
 
-        // Look for Size
-        size_t size_start = body.find("<Size>", key_end);
-        if (size_start != std::string::npos && size_start < key_end + 100) {
-            size_t size_end = body.find("</Size>", size_start);
-            if (size_end != std::string::npos) {
-                try {
-                    obj.size = std::stoull(body.substr(size_start + 6, size_end - size_start - 6));
-                } catch (...) {}
-            }
-        }
-
-        result.objects.push_back(obj);
-        pos = key_end;
+        result.objects.push_back(std::move(obj));
+        pos = seg_end;
     }
 
-    // Parse common prefixes (directories)
+    // Common prefixes count only when they appear inside a
+    // <CommonPrefixes>...</CommonPrefixes> segment (the request <Prefix>
+    // echo at the top level must not be collected).
     pos = 0;
     while (true) {
-        size_t prefix_start = body.find("<Prefix>", pos);
-        if (prefix_start == std::string::npos) break;
-        size_t prefix_end = body.find("</Prefix>", prefix_start);
-        if (prefix_end == std::string::npos) break;
+        size_t seg_start = body.find("<CommonPrefixes>", pos);
+        if (seg_start == std::string::npos) break;
+        size_t seg_end = body.find("</CommonPrefixes>", seg_start);
+        if (seg_end == std::string::npos) break;
 
-        std::string prefix = body.substr(prefix_start + 8, prefix_end - prefix_start - 8);
-        result.common_prefixes.push_back(prefix);
-        pos = prefix_end;
+        std::string segment = body.substr(seg_start, seg_end - seg_start);
+        std::string prefix = xml_extract_tag(segment, "Prefix");
+        if (!prefix.empty()) {
+            result.common_prefixes.push_back(std::move(prefix));
+        }
+        pos = seg_end;
     }
 
     return result;
