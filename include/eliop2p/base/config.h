@@ -48,7 +48,8 @@ struct CacheConfig {
 
 // P2P configuration
 struct P2PConfig {
-    uint16_t listen_port = 9000;
+    uint16_t listen_port = 9000;  // chunk transfer TCP server
+    uint16_t gossip_port = 9001;  // gossip protocol TCP server
     uint32_t max_connections = 100;
     uint32_t max_peers = 50;
     uint64_t max_upload_speed_mbps = 0;  // 0 = unlimited

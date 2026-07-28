@@ -21,6 +21,7 @@ static const size_t MAX_MESSAGE_SIZE = 64 * 1024;  // 64KB max message size
 // Implementation details
 struct NodeDiscovery::Impl {
     P2PConfig config;
+    NodeDiscovery* parent = nullptr;  // back-pointer for message dispatch
     std::unordered_map<std::string, PeerNode> peers;
     std::unordered_map<std::string, std::unordered_set<std::string>> chunk_locations;
     std::string local_node_id;
@@ -280,8 +281,12 @@ struct NodeDiscovery::Impl {
                 co_return;
             }
 
-            // Handle the message (this will be called on NodeDiscovery)
-            // Note: We need to pass this back to the main handler
+            // Dispatch to the message handlers (chunk announcements, node
+            // join/leave, state sync). This call was simply missing, so
+            // received gossip was silently dropped.
+            if (parent) {
+                parent->handle_gossip_message(*msg_opt);
+            }
 
         } catch (const std::exception& e) {
             Logger::instance().error("TCP connection handler error: " + std::string(e.what()));
@@ -423,6 +428,15 @@ struct NodeDiscovery::Impl {
             offset += 2;
             peer.port = port;
 
+            // Read gossip_port (appended after port; absent in older messages
+            // it would eat into last_seen, so it is only present in the new
+            // fixed-layout peer record guarded by the protocol version)
+            uint16_t gossip_port = 0;
+            std::memcpy(&gossip_port, data.data() + offset, 2);
+            gossip_port = ntohs(gossip_port);
+            offset += 2;
+            peer.gossip_port = gossip_port;
+
             // Read last_seen
             uint64_t last_seen = 0;
             std::memcpy(&last_seen, data.data() + offset, 8);
@@ -546,6 +560,10 @@ struct NodeDiscovery::Impl {
             uint16_t port = htons(peer.port);
             data.append(reinterpret_cast<const char*>(&port), 2);
 
+            // Write gossip_port (0 = same as port)
+            uint16_t gossip_port = htons(peer.gossip_port);
+            data.append(reinterpret_cast<const char*>(&gossip_port), 2);
+
             // Write last_seen
             uint64_t last_seen = htobe64(peer.last_seen);
             data.append(reinterpret_cast<const char*>(&last_seen), 8);
@@ -582,18 +600,23 @@ struct NodeDiscovery::Impl {
     }
 
     // Send gossip message via TCP to a peer
-    elio::coro::task<bool> send_gossip_message_to_peer(const PeerNode& peer, const GossipMessage& msg) {
+    // NOTE: peer and msg are taken BY VALUE. Callers spawn this coroutine
+    // and immediately return, so references to their stack frames would
+    // dangle by the time the coroutine body actually runs.
+    elio::coro::task<bool> send_gossip_message_to_peer(PeerNode peer, GossipMessage msg) {
         if (peer.node_id == local_node_id) {
             co_return true;  // Don't send to self
         }
 
         try {
-            // Connect to peer
+            // Connect to peer's gossip port (fall back to shared port for
+            // peers that don't advertise a distinct one)
             elio::net::tcp_options opts;
             opts.no_delay = true;
 
+            const uint16_t gossip_port = peer.gossip_port != 0 ? peer.gossip_port : peer.port;
             auto connect_result = co_await elio::net::tcp_connect(
-                elio::net::socket_address(peer.address, peer.port), opts);
+                elio::net::socket_address(peer.address, gossip_port), opts);
 
             if (!connect_result) {
                 Logger::instance().warning("Failed to connect to peer " + peer.node_id +
@@ -648,6 +671,22 @@ struct NodeDiscovery::Impl {
 
         tcp_server_running = false;
 
+        // Wake up the pending accept(): closing the listener fd does NOT
+        // necessarily complete an io_uring accept on it, so connect to
+        // ourselves once - the accept loop wakes, observes running==false,
+        // and exits. (Classic self-connect wakeup.)
+        {
+            int wake_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (wake_fd >= 0) {
+                sockaddr_in sa{};
+                sa.sin_family = AF_INET;
+                sa.sin_port = htons(listen_port);
+                inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+                ::connect(wake_fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+                ::close(wake_fd);
+            }
+        }
+
         // Close the listener to interrupt pending accepts
         if (tcp_listener) {
             tcp_listener->close();
@@ -676,7 +715,9 @@ bool PeerNode::is_active() const {
 }
 
 NodeDiscovery::NodeDiscovery(const P2PConfig& config)
-    : impl_(std::make_unique<Impl>(config)) {}
+    : impl_(std::make_unique<Impl>(config)) {
+    impl_->parent = this;
+}
 
 NodeDiscovery::~NodeDiscovery() {
     stop();
@@ -714,8 +755,15 @@ bool NodeDiscovery::register_node(const PeerNode& local_node) {
     Logger::instance().info("Registered node: " + local_node.node_id +
                            " at " + local_node.address + ":" + std::to_string(local_node.port));
 
-    // Start TCP server for receiving gossip messages
-    start_tcp_server();
+    // Start TCP server for receiving gossip messages. The coroutine is
+    // lazy: without spawn it is destroyed unstarted and no listener ever
+    // comes up.
+    if (impl_->scheduler) {
+        auto server_task = start_tcp_server();
+        impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(server_task)));
+    } else {
+        Logger::instance().error("Cannot start gossip TCP server: no scheduler set");
+    }
 
     // Start gossip protocol
     start_gossip_protocol();
@@ -850,6 +898,25 @@ void NodeDiscovery::start_gossip_protocol() {
     impl_->gossip_running = true;
     Logger::instance().info("Starting gossip protocol with interval: " +
                            std::to_string(impl_->gossip_interval_ms) + "ms");
+
+    // Drive periodic state-sync + heartbeat ticks. Without this loop the
+    // tick functions existed but were never called: peers would only learn
+    // about chunks via immediate announce broadcasts.
+    if (impl_->scheduler) {
+        auto loop = gossip_loop();
+        impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(loop)));
+    }
+}
+
+elio::coro::task<void> NodeDiscovery::gossip_loop() {
+    Logger::instance().debug("Gossip loop started for " + impl_->local_node_id);
+    while (impl_->gossip_running.load() && impl_->running) {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(impl_->gossip_interval_ms));
+        if (!impl_->gossip_running.load() || !impl_->running) break;
+        co_await gossip_tick();
+        co_await heartbeat_tick();
+    }
+    Logger::instance().debug("Gossip loop exited for " + impl_->local_node_id);
 }
 
 void NodeDiscovery::broadcast_node_join() {
@@ -1278,9 +1345,9 @@ uint16_t NodeDiscovery::get_listen_port() const {
 }
 
 elio::coro::task<void> NodeDiscovery::start_tcp_server() {
-    uint16_t port = impl_->config.listen_port;
+    uint16_t port = impl_->config.gossip_port;
     if (port == 0) {
-        port = 9000;  // Default port
+        port = impl_->config.listen_port;  // Fall back to shared port
     }
 
     impl_->start_tcp_server_internal(port);

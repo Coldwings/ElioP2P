@@ -17,7 +17,8 @@ namespace eliop2p {
 struct PeerNode {
     std::string node_id;
     std::string address;
-    uint16_t port;
+    uint16_t port;                // chunk transfer port
+    uint16_t gossip_port = 0;     // gossip protocol port (0 = same as port)
     uint64_t last_seen;
     uint64_t available_memory_mb;
     uint64_t available_disk_mb;
@@ -125,6 +126,9 @@ public:
     // Periodic gossip tick (called by internal timer)
     elio::coro::task<void> gossip_tick();
 
+    // Periodic heartbeat (called by internal timer)
+    elio::coro::task<void> heartbeat_tick();
+
     // Update peer latency
     void update_peer_latency(const std::string& node_id, double latency_ms);
 
@@ -133,9 +137,6 @@ public:
 
     // Get chunk rarity (how few peers have this chunk)
     uint32_t get_chunk_rarity(const std::string& chunk_id) const;
-
-    // Periodic heartbeat (called by internal timer)
-    elio::coro::task<void> heartbeat_tick();
 
     // TCP server methods
     uint16_t get_listen_port() const;
@@ -151,6 +152,11 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    // Internal gossip loop driving periodic ticks (spawned by
+    // start_gossip_protocol; a named coroutine instead of a lambda to
+    // avoid coroutine-lambda capture lifetime pitfalls)
+    elio::coro::task<void> gossip_loop();
 
     // Internal TCP communication methods
     elio::coro::task<bool> send_gossip_message(const PeerNode& peer, const GossipMessage& msg);

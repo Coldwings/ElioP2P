@@ -111,6 +111,7 @@ public:
 
             transfer_manager_ = std::make_shared<TransferManager>(config.p2p);
             transfer_manager_->set_scheduler(global_scheduler_);
+            transfer_manager_->set_node_discovery(node_discovery_.get());
 
             // Wire chunk serving: other peers download from our cache, and
             // chunks pushed to us (Upload) land in our cache. Without these
@@ -118,10 +119,13 @@ public:
             transfer_manager_->set_chunk_manager(cache_manager_.get());
             transfer_manager_->set_chunk_data_provider(
                 [cm = cache_manager_](const std::string& chunk_id)
-                    -> std::optional<std::vector<uint8_t>> {
+                    -> std::shared_ptr<const std::vector<uint8_t>> {
                     auto chunk = cm->get_chunk(chunk_id);
-                    if (!chunk) return std::nullopt;
-                    return std::move(chunk->data());
+                    if (!chunk) return nullptr;
+                    // Alias the chunk's data: the returned shared_ptr keeps
+                    // the Chunk alive, so no copy is needed on the serve path.
+                    return std::shared_ptr<const std::vector<uint8_t>>(
+                        chunk, &chunk->data());
                 });
             transfer_manager_->set_chunk_data_consumer(
                 [cm = cache_manager_](const std::string& chunk_id,

@@ -282,7 +282,7 @@ struct TransferManager::Impl {
             }
 
             // Check if we have this chunk
-            std::optional<std::vector<uint8_t>> chunk_data;
+            std::shared_ptr<const std::vector<uint8_t>> chunk_data;
             if (chunk_data_provider) {
                 chunk_data = chunk_data_provider(chunk_id);
             }
@@ -369,6 +369,7 @@ struct TransferManager::Impl {
             try {
                 auto stream_result = co_await tcp_listener->accept();
                 if (!stream_result) {
+                    if (!tcp_server_running) break;
                     continue;
                 }
 
@@ -379,10 +380,14 @@ struct TransferManager::Impl {
             } catch (const std::exception& e) {
                 if (tcp_server_running) {
                     Logger::instance().error("TCP server error: " + std::string(e.what()));
+                } else {
+                    break;
                 }
             }
         }
 
+        // Signal stop_tcp_server() that the loop actually exited
+        server_stopped = true;
         co_return;
     }
 };
@@ -396,6 +401,17 @@ TransferManager::~TransferManager() {
 
 bool TransferManager::start() {
     impl_->running = true;
+
+    // Start the chunk transfer TCP server so peers can download from us.
+    // start_tcp_server is a lazy coroutine - spawn it or it never runs.
+    if (!impl_->scheduler) {
+        impl_->scheduler = std::make_shared<elio::runtime::scheduler>(2);
+        impl_->scheduler_owned = true;
+        impl_->scheduler->start();
+    }
+    auto server_task = start_tcp_server();
+    impl_->scheduler->spawn(elio::coro::detail::task_access::release(std::move(server_task)));
+
     Logger::instance().info("Transfer manager started");
     return true;
 }
@@ -459,14 +475,35 @@ void TransferManager::stop_tcp_server() {
     Logger::instance().info("Stopping TCP chunk server...");
     impl_->tcp_server_running = false;
 
+    // Self-connect wakeup: closing the listener fd does not necessarily
+    // complete an io_uring accept pending on it. One dummy connection makes
+    // the accept loop wake up and observe tcp_server_running == false.
+    {
+        int wake_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (wake_fd >= 0) {
+            sockaddr_in sa{};
+            sa.sin_family = AF_INET;
+            sa.sin_port = htons(impl_->listen_port);
+            inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+            ::connect(wake_fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+            ::close(wake_fd);
+        }
+    }
+
     if (impl_->tcp_listener) {
         impl_->tcp_listener->close();
         impl_->tcp_listener = std::nullopt;
     }
 
-    // Wait for server to stop
-    while (!impl_->server_stopped.load()) {
+    // Wait for the accept loop to exit. If the listener close does not
+    // interrupt a pending accept on this platform, give up after 2s and let
+    // scheduler shutdown reclaim the coroutine instead of hanging forever.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!impl_->server_stopped.load() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!impl_->server_stopped.load()) {
+        Logger::instance().warning("TCP chunk server stop timed out (accept still pending)");
     }
 
     Logger::instance().info("TCP chunk server stopped");
@@ -636,6 +673,18 @@ elio::coro::task<PeerDownloadResult> download_from_peer(
             Logger::instance().error("Unexpected message type from peer: " + peer.node_id);
             co_await stream.close();
             co_return result;
+        }
+
+        // The server echoes the chunk_id after the response header; consume
+        // it before the payload or every byte would be misaligned.
+        if (resp_header.chunk_id_length > 0 && resp_header.chunk_id_length <= 256) {
+            std::vector<char> id_buf(resp_header.chunk_id_length);
+            if (co_await read_exact(stream, id_buf.data(), id_buf.size()) !=
+                static_cast<ssize_t>(id_buf.size())) {
+                Logger::instance().error("Failed to read echoed chunk_id from peer: " + peer.node_id);
+                co_await stream.close();
+                co_return result;
+            }
         }
 
         // Read chunk data into the private buffer
@@ -1160,6 +1209,12 @@ void TransferManager::set_chunk_manager(ChunkManager* manager) {
 
 void TransferManager::set_node_discovery(NodeDiscovery* discovery) {
     impl_->node_discovery = discovery;
+}
+
+void TransferManager::announce_local_chunk(const std::string& chunk_id) {
+    if (impl_->node_discovery) {
+        impl_->node_discovery->announce_chunk(chunk_id);
+    }
 }
 
 std::shared_ptr<ChunkTransferContext> TransferManager::get_transfer_context(
