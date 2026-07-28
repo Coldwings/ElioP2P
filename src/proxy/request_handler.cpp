@@ -321,12 +321,14 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
 
     // Assemble the body chunk by chunk. Each chunk independently resolves
     // via local cache -> P2P -> storage, so a partially-cached object only
-    // fetches the missing pieces.
+    // fetches the missing pieces. Per-chunk provenance is exposed in the
+    // X-Chunk-Sources response header.
     response.body.reserve(is_range ? (range.end - range.start + 1) : obj_info->size);
     std::string x_cache = "HIT";
+    std::ostringstream chunk_sources;
 
     for (uint64_t idx = first_chunk; idx <= last_chunk; ++idx) {
-        auto data = co_await fetch_chunk(*cache_key_info, *obj_info, idx);
+        auto [data, source] = co_await fetch_chunk(*cache_key_info, *obj_info, idx);
         if (!data) {
             Logger::instance().error("Failed to fetch chunk " + std::to_string(idx) +
                                      " of " + cache_key_info->full_object_key);
@@ -337,6 +339,13 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
             std::string msg = "Failed to fetch object data";
             response.body.assign(msg.begin(), msg.end());
             co_return response;
+        }
+
+        if (idx > first_chunk) chunk_sources << ",";
+        switch (source) {
+            case ChunkSource::Cache:   chunk_sources << idx << ":CACHE"; break;
+            case ChunkSource::P2P:     chunk_sources << idx << ":P2P"; x_cache = "P2P"; break;
+            case ChunkSource::Storage: chunk_sources << idx << ":STORAGE"; if (x_cache == "HIT") x_cache = "MISS"; break;
         }
 
         // Trim edges for range requests
@@ -354,15 +363,6 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
         response.body.insert(response.body.end(),
                              data->begin() + slice_begin,
                              data->begin() + slice_end);
-
-        // Track provenance: if any chunk came from beyond local cache the
-        // overall response is not a pure HIT (per-chunk detail is logged)
-        if (x_cache == "HIT") {
-            // fetch_chunk logs the actual source; response header uses the
-            // first non-HIT source seen. For simplicity mark mixed as MISS
-            // only when the first chunk missed; detailed per-chunk sources
-            // are visible in logs.
-        }
     }
 
     if (is_range) {
@@ -378,6 +378,8 @@ elio::coro::task<HttpResponse> RequestHandler::handle_request(const HttpRequest&
     response.set_header("Content-Type", "application/octet-stream");
     response.set_header("Accept-Ranges", "bytes");
     response.set_header("Content-Length", std::to_string(response.body.size()));
+    response.set_header("X-Cache", x_cache);
+    response.set_header("X-Chunk-Sources", chunk_sources.str());
     if (!obj_info->etag.empty()) {
         response.set_header("ETag", obj_info->etag);
     }
@@ -492,9 +494,10 @@ RequestHandler::get_object_info(const CacheKeyInfo& info) {
     co_return obj;
 }
 
-elio::coro::task<std::shared_ptr<const std::vector<uint8_t>>>
+elio::coro::task<std::pair<std::shared_ptr<const std::vector<uint8_t>>, RequestHandler::ChunkSource>>
 RequestHandler::fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj,
                             uint64_t chunk_index) {
+    const auto FAILED = std::pair<std::shared_ptr<const std::vector<uint8_t>>, ChunkSource>{nullptr, ChunkSource::Storage};
     const uint64_t chunk_size = impl_->chunk_size_mb * 1024 * 1024;
     const uint64_t offset = chunk_index * chunk_size;
     const std::string chunk_id =
@@ -504,7 +507,7 @@ RequestHandler::fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj,
     if (impl_->cache_manager) {
         if (auto chunk = impl_->cache_manager->get_chunk(chunk_id)) {
             Logger::instance().debug("Chunk HIT: " + chunk_id);
-            co_return std::shared_ptr<const std::vector<uint8_t>>(chunk, &chunk->data());
+            co_return std::make_pair(std::shared_ptr<const std::vector<uint8_t>>(chunk, &chunk->data()), ChunkSource::Cache);
         }
     }
 
@@ -531,19 +534,19 @@ RequestHandler::fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj,
                 impl_->cache_manager->store_chunk(chunk_id, *data);
             }
             transfer_manager->announce_local_chunk(chunk_id);
-            co_return std::make_shared<const std::vector<uint8_t>>(std::move(*data));
+            co_return std::make_pair(std::make_shared<const std::vector<uint8_t>>(std::move(*data)), ChunkSource::P2P);
         }
     }
 
     // 3. Storage origin: range GET for exactly this chunk
     if (!impl_->storage_client) {
-        co_return nullptr;
+        co_return FAILED;
     }
     const uint64_t want = std::min(chunk_size, obj.size - offset);
     auto data = co_await impl_->storage_client->get_object(info.bucket, info.object_key,
                                                            offset, want);
     if (!data) {
-        co_return nullptr;
+        co_return FAILED;
     }
 
     Logger::instance().info("Chunk from storage: " + chunk_id);
@@ -582,7 +585,7 @@ RequestHandler::fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj,
     if (transfer_manager) {
         transfer_manager->announce_local_chunk(chunk_id);
     }
-    co_return std::make_shared<const std::vector<uint8_t>>(std::move(*data));
+    co_return std::make_pair(std::make_shared<const std::vector<uint8_t>>(std::move(*data)), ChunkSource::Storage);
 }
 
 } // namespace eliop2p

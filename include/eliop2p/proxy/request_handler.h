@@ -120,9 +120,13 @@ public:
     elio::coro::task<std::optional<ObjectInfo>>
     get_object_info(const CacheKeyInfo& info);
 
+    // Where a chunk came from (surfaced in the X-Chunk-Sources response
+    // header for observability of partial-cache serving)
+    enum class ChunkSource { Cache, P2P, Storage };
+
     // Fetch a single chunk by index: local cache -> P2P -> storage range GET.
-    // Returns the chunk data; nullopt if every source failed.
-    elio::coro::task<std::shared_ptr<const std::vector<uint8_t>>>
+    // Returns the chunk data and where it came from; nullopt data on failure.
+    elio::coro::task<std::pair<std::shared_ptr<const std::vector<uint8_t>>, ChunkSource>>
     fetch_chunk(const CacheKeyInfo& info, const ObjectInfo& obj, uint64_t chunk_index);
 
 private:

@@ -57,3 +57,7 @@ endif()
 
     add_executable(head_probe head_probe.cpp)
     target_link_libraries(head_probe PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto)
+
+    # Manual E2E: on-demand partial reads of a large object over P2P
+    add_executable(e2e_p2p_partial e2e_p2p_partial.cpp)
+    target_link_libraries(e2e_p2p_partial PRIVATE ElioP2Plib OpenSSL::SSL OpenSSL::Crypto)
