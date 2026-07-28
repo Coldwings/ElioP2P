@@ -724,31 +724,25 @@ elio::coro::task<std::optional<std::vector<ReplicationCommand>>> ControlPlaneCli
                 Logger::instance().info("Received " + std::to_string(commands.size()) +
                                         " replication commands");
 
-                // The batch parsed successfully; acknowledge each command so
-                // the server stops redelivering it.
-                std::vector<std::string> command_ids;
-                for (const auto& cmd : commands) {
-                    if (!cmd.command_id.empty()) {
-                        command_ids.push_back(cmd.command_id);
+                // Deliver to the subscribed handler FIRST: the ACK below
+                // only happens after processing, so a crash in between
+                // causes the server to redeliver (at-least-once semantics).
+                if (impl_->replication_callback) {
+                    try {
+                        impl_->replication_callback(commands);
+                    } catch (const std::exception& e) {
+                        Logger::instance().error("Replication command callback failed: " +
+                                                 std::string(e.what()));
+                        // Do NOT ACK: processing failed, let the server redeliver
+                        co_return commands;
                     }
                 }
-                if (!command_ids.empty()) {
-                    co_await elio::spawn_blocking(
-                        [endpoint, port, node_id, command_ids]() {
-                            for (const auto& id : command_ids) {
-                                json ack_body = {{"command_id", id}};
-                                const auto ack_result = SimpleHttpClient::http_request(
-                                    endpoint, port, "POST",
-                                    "/api/v1/nodes/" + node_id + "/commands/ack",
-                                    ack_body.dump(),
-                                    {{"Content-Type", "application/json"}});
-                                if (ack_result.first != 200 && ack_result.first != 204) {
-                                    Logger::instance().warning(
-                                        "Failed to ack replication command " + id +
-                                        ", code: " + std::to_string(ack_result.first));
-                                }
-                            }
-                        });
+
+                // Acknowledge each command so the server stops redelivering it
+                for (const auto& cmd : commands) {
+                    if (!cmd.command_id.empty()) {
+                        co_await ack_command(cmd.command_id);
+                    }
                 }
             }
 
@@ -764,6 +758,42 @@ elio::coro::task<std::optional<std::vector<ReplicationCommand>>> ControlPlaneCli
 
 void ControlPlaneClient::set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler) {
     impl_->scheduler = scheduler;
+}
+
+
+elio::coro::task<bool> ControlPlaneClient::ack_command(const std::string& command_id) {
+    if (!impl_->connected.load() || command_id.empty()) {
+        co_return false;
+    }
+
+    std::string node_id;
+    {
+        std::lock_guard<std::mutex> lock(impl_->node_id_mutex);
+        node_id = impl_->registered_node_id;
+    }
+    if (node_id.empty()) {
+        co_return false;
+    }
+
+    const std::string endpoint = impl_->config.endpoint;
+    const uint16_t port = impl_->config.port;
+
+    auto [code, response] = co_await elio::spawn_blocking(
+        [endpoint, port, node_id, command_id]() {
+            json ack_body = {{"command_id", command_id}};
+            return SimpleHttpClient::http_request(
+                endpoint, port, "POST",
+                "/api/v1/nodes/" + node_id + "/commands/ack",
+                ack_body.dump(),
+                {{"Content-Type", "application/json"}});
+        });
+
+    if (code != 200 && code != 204) {
+        Logger::instance().warning("Failed to ack replication command " + command_id +
+                                   ", code: " + std::to_string(code));
+        co_return false;
+    }
+    co_return true;
 }
 
 } // namespace eliop2p

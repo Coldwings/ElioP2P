@@ -111,8 +111,16 @@ public:
     // Check if heartbeat is running
     bool is_heartbeat_running() const;
 
-    // Get pending replication commands
+    // Get pending replication commands.
+    // If a ReplicationCommandCallback is subscribed, commands are delivered
+    // to it first and ACKed only after the callback returns (at-least-once
+    // semantics: a crash before ACK causes redelivery). Without a callback,
+    // commands are ACKed right after successful parsing.
     elio::coro::task<std::optional<std::vector<ReplicationCommand>>> fetch_replication_commands();
+
+    // Explicitly ACK a single command (for callers that process commands
+    // asynchronously and want to control the ACK point themselves).
+    elio::coro::task<bool> ack_command(const std::string& command_id);
 
     // Set scheduler for coroutines (for global scheduler integration)
     void set_scheduler(std::shared_ptr<elio::runtime::scheduler> scheduler);
